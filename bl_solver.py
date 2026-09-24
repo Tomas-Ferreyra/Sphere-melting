@@ -12,7 +12,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt    
 
 from scipy.integrate import cumulative_trapezoid, solve_bvp
-from scipy.sparse import lil_matrix
 from scipy.linalg import solve_banded
 from scipy.sparse import issparse
 from scipy.sparse.linalg import spsolve
@@ -698,171 +697,6 @@ def get_adim_vals( x, y, Y_all, Ste, Pr, dif_rho=1.09 ):
     return u, v, th, v_ret
 
 
-#%%
-
-# =============================================================================
-# Check ini condition solver
-# =============================================================================
-eta = np.linspace(0, 4, 100)
-
-fig, ax = plt.subplots(1,3, layout='constrained', figsize=(13,4))
-
-# Pr = 7
-coso = ['-','--']
-for n,Pr in enumerate([7, 0.7]):
-
-    K = 0
-    Lambda = 3.6e-3
-    
-    funcs0 = [ 2., 9/4, 1, 3/2]
-    
-    sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
-    f, fp, fpp, theta, thetap =  sol.sol(eta)
-    
-    ax[0].plot(eta, fp, coso[n], label=r"$f'$")
-    ax[0].plot(eta, f, coso[n], label=r"$f$")
-    
-    ax[0].plot(eta, theta, coso[n], label=r"$\Theta$")
-
-ax[0].set_xlabel(r"$\eta$")
-ax[0].legend()
-ax[0].grid()
-# plt.show()
-
- 
-for n,Lambda in enumerate([3.6e-3, 4]):
-
-    K = 0
-    Pr = 7
-    
-    funcs0 = [ 2., 9/4, 1, 3/2]
-    
-    sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
-    f, fp, fpp, theta, thetap =  sol.sol(eta)
-    
-    ax[1].plot(eta, fp, coso[n], label=r"$f'$")
-    ax[1].plot(eta, f, coso[n], label=r"$f$")
-    
-    ax[1].plot(eta, theta, coso[n], label=r"$\Theta$")
-
-ax[1].set_xlabel(r"$\eta$")
-ax[1].legend()
-ax[1].grid()
-
-for n,K in enumerate([0, 0.1]):
-
-    Pr = 7
-    Lambda = 3.6e-3
-    
-    funcs0 = [ 2., 9/4, 1, 3/2]
-    
-    sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
-    f, fp, fpp, theta, thetap =  sol.sol(eta)
-    
-    ax[2].plot(eta, fp, coso[n], label=r"$f'$")
-    ax[2].plot(eta, f, coso[n], label=r"$f$")
-    
-    ax[2].plot(eta, theta, coso[n], label=r"$\Theta$")
-
-ax[2].set_xlabel(r"$\eta$")
-ax[2].legend()
-ax[2].grid()
-
-plt.show()
-
-
-#%%
-eta = np.linspace(0, 4, 10)
-
-Pr = 7
-K = 0.0
-Lambda = 3.6e-3
-
-funcs0 = [ 2., 9/4, 1, 3/2]
-H0, V0, F0, I0 = funcs0
-
-t1 = time()
-sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0, max_nodes=1e5, tol=1e-7 )    
-f, fp, fpp, th, thp =  sol.sol(eta)
-eq1, eq2 = eqs 
-t2 = time()
-print( t2-t1 )
-
-sol_th = cumulative_trapezoid( np.exp( -H0*Pr * cumulative_trapezoid( f, eta, initial=0 )), eta, initial=0 ) / \
-        np.trapezoid( np.exp( -H0*Pr * cumulative_trapezoid( f, eta, initial=0 )), eta )
-
-
-
-plt.figure()
-
-# plt.plot(eta, fp)
-# plt.plot(eta, th)
-
-plt.plot(eta, eq1)
-plt.plot(eta, eq2)
-
-# plt.plot( eta, th - sol_th )
-# plt.plot( eta, sol_th)
-
-plt.show()
-
-
-
-#%%
-
-# =============================================================================
-# Check solver
-# =============================================================================
-
-Pr = 7
-K = 0.1
-Lambda = 3.6e-3
-    
-nx, ny = 501, 1001
-xmax, ymax = np.pi/2, 4
-
-x, y, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
-
-
-#%%
-plt.figure()
-
-# labs = [r'$f$',r'$p$',r'$q$',r'$\Theta$',r'$r$']
-labs = [r'$f$',r'$f_y$',r'$f_{yy}$',r'$\Theta$',r'$\Theta_y$']
-ns = [0,150,300]
-
-# for i in range(5):
-for i in [3]:
-    plt.plot(y, (Y_all[ns[0]].T)[i], '-', label=f'{labs[i]}, x={x[ns[0]]:.4f}' )
-    plt.plot(y, (Y_all[ns[1]].T)[i], '--', label=f'{labs[i]}, x={x[ns[1]]:.4f}' )
-    plt.plot(y, (Y_all[ns[2]].T)[i], '--', label=f'{labs[i]}, x={x[ns[2]]:.4f}' )
-
-
-plt.legend()
-plt.grid()
-plt.show()
-
-
-fig, ax = plt.subplots(1,5, layout='constrained', sharey=True, figsize=(12,4))
-
-for v in range(5):
-    im = ax[v].imshow( Y_all[:,:,v].T, extent=(x[0],x[-1],y[0],y[-1]), origin='lower', aspect='auto' )
-    # im = ax[v].imshow( Y_all[:,:,v].T, origin='lower' )
-
-    fig.colorbar(im, ax=ax[v], shrink=0.9, pad=0.03)
-    ax[v].set_title(labs[v])
-    ax[v].set_xlabel(r'$x$')
-    
-ax[0].set_ylabel(r'$y$')
-
-plt.show()
-
-
-#%%
-# =============================================================================
-# Convergence test. I'll probably use 512x2048 and ymax=3
-# =============================================================================
-
 def calc_eq_residuals( x, y, Y_all ):
     xx,yy = np.meshgrid(x,y)
     f, fy, fyy, th, thy = Y_all.T
@@ -879,228 +713,407 @@ def calc_eq_residuals( x, y, Y_all ):
 
     return np.max(np.abs(eq1)), np.max(np.abs(eq2)), (eq1, eq2)
 
-xmax, ymax = np.pi/2, 3
 
-r1s, r2s, nys = [],[],[]
-xs, thy0 = [], []
-levels = 5
-
-nxs = [256,512,1024,2048]
-# for level in range(levels):
-    # nx, ny = 2**(6+1+level),  2**(6+1+level)
-
-for nxx in nxs:
-    nx, ny = nxx, 2048
-
-    x, y, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
-    f, fy, fyy, th, thy = Y_all.T
-    r1, r2, (eq1,eq2) = calc_eq_residuals( x, y, Y_all )
-    r1s.append(r1); r2s.append(r2); nys.append(ny)
-    xs.append(x)
-    thy0.append( thy[0,:] )
-
-nys = np.array(nys)
-
-fig, ax = plt.subplots(1,2, figsize=(9,4))
-
-# ax[0].plot( nys, r1s, '.-' )
-# ax[0].plot( nys, r2s, '.-' )
-
-ax[0].plot( nxs, r1s, '.-' )
-ax[0].plot( nxs, r2s, '.-' )
-
-# plt.xscale('log')
-# plt.yscale('log')
-
-ax[0].set_ylim(0,.05)
-
-# for i in range(levels):
-#     ax[1].plot(xs[i], thy0[i], '-', label=nys[i])
-for i in range(len(nxs)):
-    ax[1].plot(xs[i], thy0[i], '-', label=nxs[i])
-ax[1].legend()
-plt.show()
-
-# print( r1s, r2s)
 #%%
 
-r1s, r2s, mys = [],[],[2,3,4,6,8]
-xs, ys, thy0 = [], [], []
-th1 = []
-nx, ny = 512*2, 1024
+# =============================================================================
+# Check ini condition solver
+# =============================================================================
 
-for my in mys:
+if __name__ == '__main__':
+
+    eta = np.linspace(0, 4, 100)
     
-    ymax = my
+    fig, ax = plt.subplots(1,3, layout='constrained', figsize=(13,4))
+    
+    # Pr = 7
+    coso = ['-','--']
+    for n,Pr in enumerate([7, 0.7]):
+    
+        K = 0
+        Lambda = 3.6e-3
+        
+        funcs0 = [ 2., 9/4, 1, 3/2]
+        
+        sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
+        f, fp, fpp, theta, thetap =  sol.sol(eta)
+        
+        ax[0].plot(eta, fp, coso[n], label=r"$f'$")
+        ax[0].plot(eta, f, coso[n], label=r"$f$")
+        
+        ax[0].plot(eta, theta, coso[n], label=r"$\Theta$")
+    
+    ax[0].set_xlabel(r"$\eta$")
+    ax[0].legend()
+    ax[0].grid()
+    # plt.show()
+    
+     
+    for n,Lambda in enumerate([3.6e-3, 4]):
+    
+        K = 0
+        Pr = 7
+        
+        funcs0 = [ 2., 9/4, 1, 3/2]
+        
+        sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
+        f, fp, fpp, theta, thetap =  sol.sol(eta)
+        
+        ax[1].plot(eta, fp, coso[n], label=r"$f'$")
+        ax[1].plot(eta, f, coso[n], label=r"$f$")
+        
+        ax[1].plot(eta, theta, coso[n], label=r"$\Theta$")
+    
+    ax[1].set_xlabel(r"$\eta$")
+    ax[1].legend()
+    ax[1].grid()
+    
+    for n,K in enumerate([0, 0.1]):
+    
+        Pr = 7
+        Lambda = 3.6e-3
+        
+        funcs0 = [ 2., 9/4, 1, 3/2]
+        
+        sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000):
+        f, fp, fpp, theta, thetap =  sol.sol(eta)
+        
+        ax[2].plot(eta, fp, coso[n], label=r"$f'$")
+        ax[2].plot(eta, f, coso[n], label=r"$f$")
+        
+        ax[2].plot(eta, theta, coso[n], label=r"$\Theta$")
+    
+    ax[2].set_xlabel(r"$\eta$")
+    ax[2].legend()
+    ax[2].grid()
+    
+    plt.show()
+
+
+#%%
+if __name__ == '__main__':
+    eta = np.linspace(0, 4, 10)
+    
+    Pr = 7
+    K = 0.0
+    Lambda = 3.6e-3
+    
+    funcs0 = [ 2., 9/4, 1, 3/2]
+    H0, V0, F0, I0 = funcs0
+    
+    t1 = time()
+    sol, eqs = solve_ode_ini(eta, Pr, Lambda, K, funcs0, max_nodes=1e5, tol=1e-7 )    
+    f, fp, fpp, th, thp =  sol.sol(eta)
+    eq1, eq2 = eqs 
+    t2 = time()
+    print( t2-t1 )
+    
+    sol_th = cumulative_trapezoid( np.exp( -H0*Pr * cumulative_trapezoid( f, eta, initial=0 )), eta, initial=0 ) / \
+            np.trapezoid( np.exp( -H0*Pr * cumulative_trapezoid( f, eta, initial=0 )), eta )
+    
+    
+    
+    plt.figure()
+    
+    # plt.plot(eta, fp)
+    # plt.plot(eta, th)
+    
+    plt.plot(eta, eq1)
+    plt.plot(eta, eq2)
+    
+    # plt.plot( eta, th - sol_th )
+    # plt.plot( eta, sol_th)
+    
+    plt.show()
+
+
+
+#%%
+
+# =============================================================================
+# Check solver
+# =============================================================================
+if __name__ == '__main__':
+
+    Pr = 7
+    K = 0.1
+    Lambda = 3.6e-3
+        
+    nx, ny = 501, 1001
+    xmax, ymax = np.pi/2, 4
+    
     x, y, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
-    f, fy, fyy, th, thy = Y_all.T
-    r1, r2, (eq1,eq2) = calc_eq_residuals( x, y, Y_all )
-    r1s.append(r1); r2s.append(r2);
-    xs.append(x); ys.append(y)
-    thy0.append( thy[0,:] )
-    th1.append( th[:,-20] )
 
 
-fig, ax = plt.subplots(1,3, figsize=(13,4))
+#%%
+if __name__ == '__main__':
+    
+    plt.figure()
+    
+    # labs = [r'$f$',r'$p$',r'$q$',r'$\Theta$',r'$r$']
+    labs = [r'$f$',r'$f_y$',r'$f_{yy}$',r'$\Theta$',r'$\Theta_y$']
+    ns = [0,150,300]
+    
+    # for i in range(5):
+    for i in [3]:
+        plt.plot(y, (Y_all[ns[0]].T)[i], '-', label=f'{labs[i]}, x={x[ns[0]]:.4f}' )
+        plt.plot(y, (Y_all[ns[1]].T)[i], '--', label=f'{labs[i]}, x={x[ns[1]]:.4f}' )
+        plt.plot(y, (Y_all[ns[2]].T)[i], '--', label=f'{labs[i]}, x={x[ns[2]]:.4f}' )
+    
+    
+    plt.legend()
+    plt.grid()
+    plt.show()
+    
+    
+    fig, ax = plt.subplots(1,5, layout='constrained', sharey=True, figsize=(12,4))
+    
+    for v in range(5):
+        im = ax[v].imshow( Y_all[:,:,v].T, extent=(x[0],x[-1],y[0],y[-1]), origin='lower', aspect='auto' )
+        # im = ax[v].imshow( Y_all[:,:,v].T, origin='lower' )
+    
+        fig.colorbar(im, ax=ax[v], shrink=0.9, pad=0.03)
+        ax[v].set_title(labs[v])
+        ax[v].set_xlabel(r'$x$')
+        
+    ax[0].set_ylabel(r'$y$')
+    
+    plt.show()
 
-ax[0].plot( mys, r1s, '.-' )
-ax[0].plot( mys, r2s, '.-' )
+#%%
+# =============================================================================
+# Convergence test. I'll probably use 512x2048 and ymax=3
+# =============================================================================
 
-# plt.xscale('log')
-# plt.yscale('log')
+if __name__ == '__main__':
 
-# ax[0].set_ylim(0,.05)
+    xmax, ymax = np.pi/2, 3
+    
+    r1s, r2s, nys = [],[],[]
+    xs, thy0 = [], []
+    levels = 5
+    
+    nxs = [256,512,1024,2048]
+    # for level in range(levels):
+        # nx, ny = 2**(6+1+level),  2**(6+1+level)
+    
+    for nxx in nxs:
+        nx, ny = nxx, 2048
+    
+        x, y, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
+        f, fy, fyy, th, thy = Y_all.T
+        r1, r2, (eq1,eq2) = calc_eq_residuals( x, y, Y_all )
+        r1s.append(r1); r2s.append(r2); nys.append(ny)
+        xs.append(x)
+        thy0.append( thy[0,:] )
+    
+    nys = np.array(nys)
+    
+    fig, ax = plt.subplots(1,2, figsize=(9,4))
+    
+    # ax[0].plot( nys, r1s, '.-' )
+    # ax[0].plot( nys, r2s, '.-' )
+    
+    ax[0].plot( nxs, r1s, '.-' )
+    ax[0].plot( nxs, r2s, '.-' )
+    
+    # plt.xscale('log')
+    # plt.yscale('log')
+    
+    ax[0].set_ylim(0,.05)
+    
+    # for i in range(levels):
+    #     ax[1].plot(xs[i], thy0[i], '-', label=nys[i])
+    for i in range(len(nxs)):
+        ax[1].plot(xs[i], thy0[i], '-', label=nxs[i])
+    ax[1].legend()
+    plt.show()
+    
+    # print( r1s, r2s)
+#%%
 
-for i in range(len(mys)):
-    ax[1].plot(xs[i], thy0[i], '-', label=mys[i])
-ax[1].legend()
+if __name__ == '__main__':
 
-for i in range(len(mys)):
-    ax[2].plot(ys[i], th1[i], '-', label=mys[i])
-ax[2].legend()
-
-plt.show()
-
-print( r1s, r2s)
-
+    r1s, r2s, mys = [],[],[2,3,4,6,8]
+    xs, ys, thy0 = [], [], []
+    th1 = []
+    nx, ny = 512*2, 1024
+    
+    for my in mys:
+        
+        ymax = my
+        x, y, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
+        f, fy, fyy, th, thy = Y_all.T
+        r1, r2, (eq1,eq2) = calc_eq_residuals( x, y, Y_all )
+        r1s.append(r1); r2s.append(r2);
+        xs.append(x); ys.append(y)
+        thy0.append( thy[0,:] )
+        th1.append( th[:,-20] )
+    
+    
+    fig, ax = plt.subplots(1,3, figsize=(13,4))
+    
+    ax[0].plot( mys, r1s, '.-' )
+    ax[0].plot( mys, r2s, '.-' )
+    
+    # plt.xscale('log')
+    # plt.yscale('log')
+    
+    # ax[0].set_ylim(0,.05)
+    
+    for i in range(len(mys)):
+        ax[1].plot(xs[i], thy0[i], '-', label=mys[i])
+    ax[1].legend()
+    
+    for i in range(len(mys)):
+        ax[2].plot(ys[i], th1[i], '-', label=mys[i])
+    ax[2].legend()
+    
+    plt.show()
+    
+    print( r1s, r2s)
+    
 
 
 #%%
 # =============================================================================
 # With actual values
 # =============================================================================
-a = 0.017 # m
-# Uinf = 0.4 #m/s
-# a = 27.10672204743023 / 1000 # m
-Uinf = 0.39976853 #m/s
 
-nu = 1e-6 # m^2/s
-g = 9.81 #m/s^2
-Tinf = 20 #°C
-Tm = 0 #°C
-alpha = 0.14e-6 # m^2/s
-
-beta = 2.07e-4 # 1/K
-
-rho_i = 916.8 # kg / m^3
-
-# rho_w = 998.19 # kg / m^3
-rho_w = 999.89 # kg / m^3
-
-
-latent = 334e3 # m^2 / s^2 o J/kg
-cp = 4184 # J/(kg°C)
-
-
-Re = a * Uinf / nu
-Pr = nu / alpha
-Ste = cp * (Tinf - Tm) / latent
-Gr = g * beta * (Tinf-Tm) * a**3 / nu**2
-
-K = (rho_w/rho_i - 1) * Ste/Pr * 0
-Lambda = Gr / Re**2
-
-print( Re, Gr, Pr, Ste )
-print(K, Lambda)
-
-nx, ny = 512, 2048
-xmax, ymax = np.pi/2, 3
-
-xad, yad, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
-
-uad, vad, thad, v_retad = get_adim_vals( xad, yad, Y_all, Ste, Pr, dif_rho= rho_w / rho_i  )
-
-x, y = xad * a, yad * a / np.sqrt(Re)
-u, v = uad * Uinf, vad * Uinf / np.sqrt(Re)
-T = thad * (Tinf-Tm) + Tm
-v_ret = v_retad * Uinf / np.sqrt(Re)
-
-#%%
-
-
-plt.figure()
-
-plt.imshow( T, extent=(x[0]/a * 180 /np.pi, x[-1]/a * 180 /np.pi,y[0],y[-1]), origin='lower', aspect='auto' )
-plt.colorbar()
-
-plt.show()
-
-plt.figure()
-# plt.plot( x/a * 180 /np.pi, v_ret * 1000, '-'  )
-
-plt.plot( x/a * 180 /np.pi, v_ret * a / nu, '-'  )
-plt.xlabel( r'$\theta$ (°)' )
-plt.ylabel( r'$\dot{R} R / \nu$ ' )
-
-plt.show()
-
-
-#%%
-
-
-
-
-
-
-
-
-
-#%%
-
-
-
-
-
-
-
-
-y,dy = np.linspace(0, 4, ny, retstep=True)
-x,dx = np.linspace(0, 1.5, nx, retstep=True)
-# x,dx = np.linspace(0, np.pi/2, 101, retstep=True)
-
-Y_all = np.zeros((nx, ny, 5))
-
-funcs0 = [H(0), V(0), F(0), I(0)]
+if __name__ == '__main__':
     
-sol, eqs = solve_ode_ini(y, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000)
-f, fp, fpp, th, thp = sol.sol(y)
-Y0 = build_Y0_from_ini(y,sol) # Y = f, p, q, Theta, r
-Y_all[0] = Y0
+    a = 0.017 # m
+    # Uinf = 0.4 #m/s
+    # a = 27.10672204743023 / 1000 # m
+    Uinf = 0.39976853 #m/s
+    
+    nu = 1e-6 # m^2/s
+    g = 9.81 #m/s^2
+    Tinf = 20 #°C
+    Tm = 0 #°C
+    alpha = 0.14e-6 # m^2/s
+    
+    beta = 2.07e-4 # 1/K
+    
+    rho_i = 916.8 # kg / m^3
+    
+    # rho_w = 998.19 # kg / m^3
+    rho_w = 999.89 # kg / m^3
+    
+    
+    latent = 334e3 # m^2 / s^2 o J/kg
+    cp = 4184 # J/(kg°C)
+    
+    
+    Re = a * Uinf / nu
+    Pr = nu / alpha
+    Ste = cp * (Tinf - Tm) / latent
+    Gr = g * beta * (Tinf-Tm) * a**3 / nu**2
+    
+    K = (rho_w/rho_i - 1) * Ste/Pr * 0
+    Lambda = Gr / Re**2
+    
+    print( Re, Gr, Pr, Ste )
+    print(K, Lambda)
+    
+    nx, ny = 512, 2048
+    xmax, ymax = np.pi/2, 3
+    
+    xad, yad, Y_all = sol_boundary_layer(nx, ny, xmax, ymax, Pr, Lambda, K, max_iter=40, tol_newton=1e-8, eta_max=None, tol_bvp=1e-7, max_nodes=50000 )
+    
+    uad, vad, thad, v_retad = get_adim_vals( xad, yad, Y_all, Ste, Pr, dif_rho= rho_w / rho_i  )
+    
+    x, y = xad * a, yad * a / np.sqrt(Re)
+    u, v = uad * Uinf, vad * Uinf / np.sqrt(Re)
+    T = thad * (Tinf-Tm) + Tm
+    v_ret = v_retad * Uinf / np.sqrt(Re)
 
-t1 = time()
+#%%
+if __name__ == '__main__':
+    
+    plt.figure()
+    
+    plt.imshow( T, extent=(x[0]/a * 180 /np.pi, x[-1]/a * 180 /np.pi,y[0],y[-1]), origin='lower', aspect='auto' )
+    plt.colorbar()
+    
+    plt.show()
+    
+    plt.figure()
+    # plt.plot( x/a * 180 /np.pi, v_ret * 1000, '-'  )
+    
+    plt.plot( x/a * 180 /np.pi, v_ret * a / nu, '-'  )
+    plt.xlabel( r'$\theta$ (°)' )
+    plt.ylabel( r'$\dot{R} R / \nu$ ' )
+    
+    plt.show()
 
-Y_ini = Y_all[0] + 0.0
-xm, Hm, Vm, Fm, I_val = x[0]+dx/2, H( x[0]+dx/2 ), V( x[0]+dx/2 ), F( x[0]+dx/2 ), I( x[1] )
-Y = newton_step(Y_ini, Y_all[0], H, V, F, I, xm, dx, dy, Pr, Lambda, K, max_iter=20, tol=1e-8)
-Y_all[1] = Y
 
-t2 = time()
-
-Y_ini = 2 * Y_all[1] - Y_all[0]
-xm, Hm, Vm, Fm, I_val = x[1]+dx/2, H( x[1]+dx/2 ), V( x[1]+dx/2 ), F( x[1]+dx/2 ), I( x[2] )
-Y = newton_step(Y_ini, Y_all[1], H, V, F, I, xm, dx, dy, Pr, Lambda, K, max_iter=20, tol=1e-8)
-Y_all[2] = Y
-
-t3 = time()
+#%%
 
 
-print(t2-t1, t3-t2)
 
 
-plt.figure()
-# plt.imshow( mdiff )
-# plt.colorbar()
 
-labs = [r'$f$',r'$p$',r'$q$',r'$\Theta$',r'$r$']
-# for i in range(5):
-for i in [1]:
-    plt.plot(y, (Y_all[0].T)[i], '-', label=labs[i] )
-    plt.plot(y, (Y_all[1].T)[i], '--', label=labs[i] )
-    plt.plot(y, (Y_all[2].T)[i], '--', label=labs[i] )
 
-plt.legend()
-plt.grid()
-plt.show()
+
+
+
+#%%
+
+
+
+
+
+if __name__ == '__main__':
+
+    
+    y,dy = np.linspace(0, 4, ny, retstep=True)
+    x,dx = np.linspace(0, 1.5, nx, retstep=True)
+    # x,dx = np.linspace(0, np.pi/2, 101, retstep=True)
+    
+    Y_all = np.zeros((nx, ny, 5))
+    
+    funcs0 = [H(0), V(0), F(0), I(0)]
+        
+    sol, eqs = solve_ode_ini(y, Pr, Lambda, K, funcs0 ) #, eta_max=None, tol=1e-7, max_nodes=50000)
+    f, fp, fpp, th, thp = sol.sol(y)
+    Y0 = build_Y0_from_ini(y,sol) # Y = f, p, q, Theta, r
+    Y_all[0] = Y0
+    
+    t1 = time()
+    
+    Y_ini = Y_all[0] + 0.0
+    xm, Hm, Vm, Fm, I_val = x[0]+dx/2, H( x[0]+dx/2 ), V( x[0]+dx/2 ), F( x[0]+dx/2 ), I( x[1] )
+    Y = newton_step(Y_ini, Y_all[0], H, V, F, I, xm, dx, dy, Pr, Lambda, K, max_iter=20, tol=1e-8)
+    Y_all[1] = Y
+    
+    t2 = time()
+    
+    Y_ini = 2 * Y_all[1] - Y_all[0]
+    xm, Hm, Vm, Fm, I_val = x[1]+dx/2, H( x[1]+dx/2 ), V( x[1]+dx/2 ), F( x[1]+dx/2 ), I( x[2] )
+    Y = newton_step(Y_ini, Y_all[1], H, V, F, I, xm, dx, dy, Pr, Lambda, K, max_iter=20, tol=1e-8)
+    Y_all[2] = Y
+    
+    t3 = time()
+    
+    
+    print(t2-t1, t3-t2)
+    
+    
+    plt.figure()
+    # plt.imshow( mdiff )
+    # plt.colorbar()
+    
+    labs = [r'$f$',r'$p$',r'$q$',r'$\Theta$',r'$r$']
+    # for i in range(5):
+    for i in [1]:
+        plt.plot(y, (Y_all[0].T)[i], '-', label=labs[i] )
+        plt.plot(y, (Y_all[1].T)[i], '--', label=labs[i] )
+        plt.plot(y, (Y_all[2].T)[i], '--', label=labs[i] )
+    
+    plt.legend()
+    plt.grid()
+    plt.show()
 
 
 
@@ -1157,14 +1170,6 @@ plt.show()
 
 
 #%%
-
-
-
-
-
-
-
-
 
 
 
