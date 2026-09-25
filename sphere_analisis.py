@@ -15,6 +15,7 @@ import scipy.ndimage as snd
 import glob
 import h5py
 
+from matplotlib.lines import Line2D
 from matplotlib.path import Path
 from skimage.filters import gaussian
 from skimage.measure import find_contours
@@ -22,23 +23,18 @@ from tqdm import tqdm
 
 from scipy.optimize import least_squares
 from scipy.ndimage import gaussian_filter1d
+from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import griddata, interp1d
-
-from skimage.morphology import local_minima, disk, remove_small_holes, binary_erosion, binary_dilation, binary_closing, binary_opening 
-
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree, dijkstra, breadth_first_order, connected_components
 from scipy.spatial import cKDTree
-from sklearn.neighbors import NearestNeighbors, kneighbors_graph
-import networkx as nx
 from scipy.signal import convolve2d, savgol_filter
 
-# import skimage as ski
-# from scipy.optimize import root_scalar
-# from scipy.integrate import quad
+from skimage.morphology import local_minima, disk, remove_small_holes, binary_erosion, binary_dilation, binary_closing, binary_opening 
+from sklearn.neighbors import NearestNeighbors, kneighbors_graph
 
-# import os
-# import json
 
-# from datetime import timedelta
+
 from time import time
 
 import os 
@@ -675,6 +671,1178 @@ def make_circle_plot( axs, radii_ticks = [10,20,30], angle_tick_dist=45 ):
         ax.add_patch(circle_clip)
     
 
+
+def buscar_bordes_rap(tramo, k=8):
+    """
+    Find the two endpoints of an open curve given as an (N, 2) float array.
+
+    Returns (x_list, y_list, ind), where ind are the row indices of the
+    endpoints in `tramo`.
+    """
+    tramo = np.asarray(tramo, dtype=float)
+    n = len(tramo)
+    if n <= 2:
+        return [tramo[0, 0]], [tramo[0, 1]], [0]
+
+    # k-nearest-neighbour graph (edge weight = Euclidean distance)
+    k = min(k, n - 1)
+    dist, idx = cKDTree(tramo).query(tramo, k=k + 1)
+    rows = np.repeat(np.arange(n), k)
+    cols = idx[:, 1:].ravel()
+    w = np.maximum(dist[:, 1:].ravel(), 1e-12)   # zero weights would be dropped by scipy
+    ok = rows != cols                             # guard against self-loops from duplicate points
+    G = csr_matrix((w[ok], (rows[ok], cols[ok])), shape=(n, n))
+
+    # the MST removes shortcuts, leaving a tree that follows the curve
+    mst = minimum_spanning_tree(G)
+
+    # "double sweep": farthest point from anywhere is one end,
+    # farthest point from that end is the other end
+    d0 = dijkstra(mst, directed=False, indices=0)
+    d0[~np.isfinite(d0)] = -1
+    a = int(np.argmax(d0))
+
+    da = dijkstra(mst, directed=False, indices=a)
+    da[~np.isfinite(da)] = -1
+    b = int(np.argmax(da))
+
+    ind = [a, b]
+    return list(tramo[ind, 0]), list(tramo[ind, 1]), ind
+
+
+def ordenar_tramo_rap(tramo, k=8):
+
+    tramo = np.asarray(tramo, dtype=float)
+    n = len(tramo)
+    if n <= 2:
+        return tramo.copy()
+
+    # k-nearest-neighbour graph, increasing k until it is connected
+    tree = cKDTree(tramo)
+    k = min(k, n - 1)
+    while True:
+        dist, idx = tree.query(tramo, k=k + 1)
+        rows = np.repeat(np.arange(n), k)
+        cols = idx[:, 1:].ravel()
+        w = np.maximum(dist[:, 1:].ravel(), 1e-12)   # scipy drops zero weights
+        ok = rows != cols                             # ignore self-loops from duplicate points
+        G = csr_matrix((w[ok], (rows[ok], cols[ok])), shape=(n, n))
+        if connected_components(G, directed=False)[0] == 1 or k >= n - 1:
+            break
+        k = min(2 * k, n - 1)
+
+    # the MST removes shortcuts and follows the curve
+    mst = minimum_spanning_tree(G)
+
+    # double sweep: find the two borders (ends of the longest path)
+    d0 = dijkstra(mst, directed=False, indices=0)
+    d0[~np.isfinite(d0)] = -1
+    a = int(np.argmax(d0))                            # first border
+
+    da = dijkstra(mst, directed=False, indices=a)     # distance along the curve from a
+    da[~np.isfinite(da)] = np.inf                     # unreachable points (if any) go last
+    order = np.argsort(da, kind="stable")             # starts at a, ends at the other border
+
+    return tramo[order]
+
+def ordernar_contorno( x, y ):
+    tramo = np.vstack((x, y)).T
+    tra_ord = ordenar_tramo_rap(tramo)
+    return tra_ord 
+
+def ordenar_contornos( ice_xo, ice_yo):
+    x_ord, y_ord = [],[]
+    for i in range(len(ice_xo)):
+        # tramo = np.vstack((ice_xo[i], ice_yo[i])).T
+        # tra_ord = ordenar_tramo_rap(tramo)
+        tra_ord = ordernar_contorno( ice_xo[i], ice_yo[i] )
+
+        x, y = tra_ord[:,0], tra_ord[:,1]
+        ccx, ccy = np.mean(x), np.mean(y)
+        angle = np.arctan2(x - ccx, -(y - ccy) )
+        imin, imax = np.argmin(angle), np.argmax(angle)
+        sidemin = imin < imax
+
+        if sidemin:
+            ice_ox, ice_oy = x[imin:imax], y[imin:imax]
+        else:
+            ice_ox, ice_oy = x[imin:imax:-1], y[imin:imax:-1]
+
+        x_ord.append(ice_ox); y_ord.append(ice_oy)
+    return x_ord, y_ord
+
+
+def _dist_to_polygon(poly, pts, chunk=2000):
+    """Distance from each point in pts (M, 2) to the closed polyline poly (N, 2)."""
+    a = poly
+    b = np.roll(poly, -1, axis=0)                  # closing segment included
+    ab = b - a
+    ab2 = np.einsum("ij,ij->i", ab, ab)
+    ab2[ab2 == 0] = 1.0                            # degenerate (repeated) vertices
+
+    out = np.empty(len(pts))
+    for s in range(0, len(pts), chunk):            # chunked to limit memory
+        p = pts[s:s + chunk]
+        ap = p[:, None, :] - a[None, :, :]
+        t = np.clip(np.einsum("cmj,mj->cm", ap, ab) / ab2, 0.0, 1.0)
+        proj = a[None, :, :] + t[..., None] * ab[None, :, :]
+        d = np.linalg.norm(p[:, None, :] - proj, axis=2)
+        out[s:s + chunk] = d.min(axis=1)
+    return out
+
+
+def inside_mask(outer_x, outer_y, px, py, tol=0.0):
+    """
+    Boolean mask of points (px, py) that are inside the polygon (outer_x, outer_y)
+    or outside it by no more than `tol` (same units as the coordinates).
+    """
+    poly = np.column_stack((np.asarray(outer_x, float), np.asarray(outer_y, float)))
+    pts = np.column_stack((np.asarray(px, float), np.asarray(py, float)))
+    if len(poly) < 3 or len(pts) == 0:
+        return np.zeros(len(pts), dtype=bool)
+
+    mask = Path(poly).contains_points(pts)
+    if tol > 0:
+        out_idx = np.where(~mask)[0]
+        if out_idx.size:
+            d = _dist_to_polygon(poly, pts[out_idx])
+            mask[out_idx] = d <= tol
+    return mask
+
+
+def keep_inside_previous(ice_x, ice_y, lag=1, tol=0.0, use_trimmed=True, clip_early=False):
+    """
+    Keep contour i inside contour i - lag, allowing points up to `tol` outside it.
+
+    Parameters
+    ----------
+    ice_x, ice_y : list of 1D float arrays (one entry per contour, outermost first)
+    lag : int >= 1
+        How many contours back to compare against.
+    tol : float >= 0
+        Points outside the reference contour but within this distance of it
+        are kept. tol=0 gives the strict behaviour.
+    use_trimmed : bool
+        True  -> compare against the already-trimmed contour i-lag.
+        False -> compare against the original contour i-lag.
+    clip_early : bool
+        False -> the first `lag` contours are left unchanged.
+        True  -> they are compared against contour 0 instead (for i >= 1).
+    """
+    if lag < 1 or int(lag) != lag:
+        raise ValueError("lag must be an integer >= 1.")
+    if tol < 0:
+        raise ValueError("tol must be >= 0.")
+    lag = int(lag)
+
+    n = len(ice_x)
+    if n != len(ice_y):
+        raise ValueError("ice_x and ice_y must have the same number of contours.")
+
+    orig_x = [np.asarray(a, dtype=float) for a in ice_x]
+    orig_y = [np.asarray(a, dtype=float) for a in ice_y]
+    out_x, out_y = [], []
+
+    for i in range(n):
+        ref = i - lag
+        if ref < 0:
+            ref = 0 if (clip_early and i > 0) else None
+        if ref is None:
+            out_x.append(orig_x[i])
+            out_y.append(orig_y[i])
+            continue
+
+        ref_x = out_x[ref] if use_trimmed else orig_x[ref]
+        ref_y = out_y[ref] if use_trimmed else orig_y[ref]
+
+        mask = inside_mask(ref_x, ref_y, orig_x[i], orig_y[i], tol=tol)
+        out_x.append(orig_x[i][mask])
+        out_y.append(orig_y[i][mask])
+
+    return out_x, out_y
+
+
+def level_set_volume(x, y, t, c):
+    """
+    Volume of revolution associated with the sublevel set t(x,y) <= c.
+
+    V(c) = pi * integral_{t <= c} x dA
+
+    Parameters
+    ----------
+    x, y, t : 2D ndarray
+        Coordinates and scalar field on a rectangular grid.
+    c : float
+        Level-set value.
+
+    Returns
+    -------
+    V : float
+        Volume of revolution.
+    """
+    # Assume x/y form a rectangular grid.
+    dx = np.mean(np.diff(x, axis=1))
+    dy = np.mean(np.diff(y, axis=0))
+
+    mask = t <= c
+
+    return np.pi * np.sum(x[mask]) * dx * dy
+    # return np.pi * np.sum( np.abs(x[mask]) ) * dx * dy
+
+
+def level_set_area(x, y, t, c, bandwidth=None):
+    """
+    Surface area of revolution of the level set t(x,y) = c.
+
+    A(c) = pi * integral_{Gamma_c} |x| ds
+
+    Numerically approximated using a narrow-band approximation to delta(t-c):
+
+    A(c) = pi * integral |x| |grad(t)| delta(t-c) dA
+
+    Parameters
+    ----------
+    x, y, t : 2D ndarray
+        Coordinates and scalar field.
+    c : float
+        Level-set value.
+    bandwidth : float, optional
+        Width of the delta-function approximation.
+        If None, a value based on the local t spacing is estimated.
+
+    Returns
+    -------
+    A : float
+        Surface area.
+    """
+    dx = np.mean(np.diff(x, axis=1))
+    dy = np.mean(np.diff(y, axis=0))
+
+    # Gradient
+    dt_dy, dt_dx = np.gradient(t, dy, dx)
+    grad_t = np.sqrt(dt_dx**2 + dt_dy**2)
+
+    # Estimate a reasonable bandwidth if none was supplied
+    if bandwidth is None:
+        # Typical change in t between neighboring grid points
+        dt_x = np.abs(np.diff(t, axis=1))
+        dt_y = np.abs(np.diff(t, axis=0))
+
+        typical_dt = np.median(
+            np.concatenate([dt_x.ravel(), dt_y.ravel()])
+        )
+
+        bandwidth = 2.0 * typical_dt
+
+    # Gaussian approximation to delta(t-c)
+    delta = (
+        np.exp(-0.5 * ((t - c) / bandwidth)**2)
+        / (np.sqrt(2 * np.pi) * bandwidth)
+    )
+
+    integrand = np.abs(x) * grad_t * delta
+
+    return np.pi * np.sum(integrand) * dx * dy
+
+
+def level_set_volume_derivative(x, y, t, c, bandwidth=None):
+    """
+    Derivative dV/dc.
+
+    V'(c) = pi * integral_{Gamma_c} x / |grad(t)| ds
+          = pi * integral x delta(t-c) dA
+
+    Uses a Gaussian approximation to delta(t-c).
+    """
+    dx = np.mean(np.diff(x, axis=1))
+    dy = np.mean(np.diff(y, axis=0))
+
+    if bandwidth is None:
+        dt_x = np.abs(np.diff(t, axis=1))
+        dt_y = np.abs(np.diff(t, axis=0))
+
+        typical_dt = np.median( np.concatenate([dt_x.ravel(), dt_y.ravel()]) )
+
+        bandwidth = 2.0 * typical_dt
+
+    delta = ( np.exp(-0.5 * ((t - c) / bandwidth)**2) / (np.sqrt(2 * np.pi) * bandwidth) )
+
+    return np.pi * np.sum(x * delta) * dx * dy
+
+
+
+def level_set_quantities(x, y, t, levels=None, bandwidth=None,
+                         volume_side="ge"):
+    """
+    Compute V(c), A(c), and dV/dc for the level sets t(x,y) = c.
+    The level contour is revolved around the y-axis.
+
+    Parameters
+    ----------
+    x, y, t : 2D numpy arrays
+        Coordinates and scalar field on a uniform rectangular grid.
+
+    levels : array-like, optional
+        Values of c at which to evaluate the quantities.
+        If None, 200 equally spaced levels are used.
+
+    bandwidth : float, optional
+        Width of the Gaussian approximation to delta(t-c).
+        If None, estimated automatically.
+
+    volume_side : {"ge", "le"}
+        Which side of the contour is considered the enclosed region.
+        "ge": D_c = {t >= c}
+        "le": D_c = {t <= c}
+
+    Returns
+    -------
+    c, V, A, dVdc : arrays
+        If levels is None.
+
+    V, A, dVdc : arrays
+        If levels is supplied.
+
+    Notes
+    -----
+    V(c) = pi * integral_Dc |x| dA
+    A(c) = pi * integral_Gamma_c |x| ds
+    dV/dc has a sign depending on volume_side:
+        volume_side="ge": dV/dc = -pi * integral_Gamma_c |x|/|grad(t)| ds
+
+        volume_side="le": dV/dc = +pi * integral_Gamma_c |x|/|grad(t)| ds
+    """
+
+    x = np.asarray(x)
+    y = np.asarray(y)
+    t = np.asarray(t)
+
+    if x.shape != y.shape or x.shape != t.shape:
+        raise ValueError("x, y, and t must have the same shape.")
+
+    if x.ndim != 2:
+        raise ValueError("x, y, and t must be 2D arrays.")
+
+    if volume_side not in ("ge", "le"):
+        raise ValueError("volume_side must be 'ge' or 'le'.")
+
+    # ------------------------------------------------------------
+    # Grid spacing
+    # ------------------------------------------------------------
+
+    dx_array = np.diff(x, axis=1)
+    dy_array = np.diff(y, axis=0)
+
+    dx = np.mean(dx_array)
+    dy = np.mean(dy_array)
+
+    if not np.allclose(dx_array, dx):
+        raise ValueError("x grid must be uniformly spaced.")
+
+    if not np.allclose(dy_array, dy):
+        raise ValueError("y grid must be uniformly spaced.")
+
+    dA = abs(dx * dy)
+
+    # ------------------------------------------------------------
+    # Gradient
+    # ------------------------------------------------------------
+
+    dt_dy, dt_dx = np.gradient(t, abs(dy), abs(dx))
+
+    grad_t = np.sqrt(dt_dx**2 + dt_dy**2)
+
+    # ------------------------------------------------------------
+    # Levels
+    # ------------------------------------------------------------
+
+    return_all_levels = levels is None
+
+    if levels is None:
+        c = np.linspace(np.nanmin(t), np.nanmax(t), 200)
+    else:
+        c = np.asarray(levels, dtype=float)
+
+        if c.ndim == 0:
+            c = c.reshape(1)
+
+    # ------------------------------------------------------------
+    # Valid data
+    # ------------------------------------------------------------
+
+    valid = ( np.isfinite(t) & np.isfinite(x) & np.isfinite(grad_t) )
+
+    t_flat = t[valid].ravel()
+    radius_flat = np.abs(x[valid]).ravel()
+
+    # ------------------------------------------------------------
+    # Volume
+    # Sort t once, then evaluate cumulative integral for every c.
+    # ------------------------------------------------------------
+
+    order = np.argsort(t_flat)
+
+    t_sorted = t_flat[order]
+    radius_sorted = radius_flat[order]
+
+    cumulative = np.cumsum(radius_sorted) * dA
+
+    if volume_side == "le":
+        # Integral over t <= c
+        indices = np.searchsorted( t_sorted, c, side="right" )
+
+        V = np.zeros_like(c)
+        mask = indices > 0
+        V[mask] = ( np.pi * cumulative[indices[mask] - 1] )
+
+    else:
+        # Integral over t >= c. Total integral minus integral over t < c.
+        total = cumulative[-1]
+
+        indices = np.searchsorted( t_sorted, c, side="left" )
+        V = np.pi * (total - np.where( indices > 0, cumulative[indices - 1], 0.0 ))
+
+    # ------------------------------------------------------------
+    # Bandwidth for delta(t-c)
+    # ------------------------------------------------------------
+
+    if bandwidth is None:
+
+        dt_x = np.abs(np.diff(t, axis=1))
+        dt_y = np.abs(np.diff(t, axis=0))
+
+        dt_values = np.concatenate([ dt_x[np.isfinite(dt_x)], dt_y[np.isfinite(dt_y)] ])
+
+        dt_values = dt_values[dt_values > 0]
+
+        if len(dt_values) == 0:
+            raise ValueError( "Could not estimate a bandwidth from t." )
+
+        bandwidth = 2.0 * np.median(dt_values)
+
+    if bandwidth <= 0:
+        raise ValueError("bandwidth must be positive.")
+
+    # ------------------------------------------------------------
+    # A(c) and dV/dc
+    # ------------------------------------------------------------
+
+    t_valid = t[valid].ravel()
+    radius_valid = np.abs(x[valid]).ravel()
+    grad_valid = grad_t[valid].ravel()
+
+    A = np.empty_like(c)
+    dVdc = np.empty_like(c)
+
+    normalization = np.sqrt(2.0 * np.pi) * bandwidth
+
+    for i, ci in enumerate(c):
+        z = (t_valid - ci) / bandwidth
+        delta = np.exp(-0.5 * z**2) / normalization
+
+        # Surface area: A = pi * integral |x| delta(t-c)|grad t| dA
+        A[i] = ( np.pi * np.sum( radius_valid * grad_valid * delta ) * dA )
+
+        # Magnitude of dV/dc: |dV/dc| = pi * integral |x| delta(t-c) dA
+        dVdc[i] = ( np.pi * np.sum( radius_valid * delta ) * dA )
+
+    # Sign of derivative depends on which side is enclosed.
+    if volume_side == "ge":
+        dVdc = -dVdc
+
+    # ------------------------------------------------------------
+    # Return
+    # ------------------------------------------------------------
+
+    if return_all_levels:
+        return c, V, A, dVdc
+
+    return V, A, dVdc
+
+
+def interpolate_t_on_holder(xgr, ygr, tgr, hx, hy):
+    """
+    Bilinearly interpolate tgr onto holder coordinates hx, hy.
+    Handles increasing or decreasing x/y grid axes.
+    """
+
+    x_axis = np.asarray(xgr[0, :])
+    y_axis = np.asarray(ygr[:, 0])
+    t = np.asarray(tgr)
+
+    # Make axes increasing if necessary
+    if x_axis[0] > x_axis[-1]:
+        x_axis = x_axis[::-1]
+        t = t[:, ::-1]
+
+    if y_axis[0] > y_axis[-1]:
+        y_axis = y_axis[::-1]
+        t = t[::-1, :]
+
+    hx = np.asarray(hx)
+    hy = np.asarray(hy)
+
+    # Check that holder is inside grid
+    outside = ( (hx < x_axis[0]) | (hx > x_axis[-1]) | (hy < y_axis[0]) | (hy > y_axis[-1]) )
+
+
+    ix = np.searchsorted(x_axis, hx, side="right") - 1
+    iy = np.searchsorted(y_axis, hy, side="right") - 1
+
+    ix = np.clip(ix, 0, len(x_axis) - 2)
+    iy = np.clip(iy, 0, len(y_axis) - 2)
+
+    x0 = x_axis[ix]
+    x1 = x_axis[ix + 1]
+    y0 = y_axis[iy]
+    y1 = y_axis[iy + 1]
+
+    tx = (hx - x0) / (x1 - x0)
+    ty = (hy - y0) / (y1 - y0)
+
+    z00 = t[iy, ix]
+    z10 = t[iy, ix + 1]
+    z01 = t[iy + 1, ix]
+    z11 = t[iy + 1, ix + 1]
+
+    t_interp = ( (1 - tx) * (1 - ty) * z00 + tx * (1 - ty) * z10 + (1 - tx) * ty * z01 + tx * ty * z11 )
+    t_interp[outside] = -10.0
+    
+    return t_interp
+
+def holder_quantities_from_t( xgr, ygr, tgr, hol_xo, hol_yo, levels ):
+    """
+    Calculate holder volume and opening area using t evaluated
+    along the holder boundary.
+    Assumes the object corresponds to t > c.
+    
+    Returns
+    -------
+    Vh, Ah
+    """
+
+    hol_xo = np.asarray(hol_xo)
+    hol_yo = np.asarray(hol_yo)
+    levels = np.asarray(levels)
+
+    # ---------------------------------------------------------
+    # Evaluate t on holder boundary ONCE
+    # ---------------------------------------------------------
+
+    t_holder = interpolate_t_on_holder( xgr, ygr, tgr, hol_xo, hol_yo )
+
+    if np.any(~np.isfinite(t_holder)):
+        raise ValueError( "t interpolation on holder produced NaNs." )
+
+    Vh = np.full(len(levels), np.nan)
+    Ah = np.full(len(levels), np.nan)
+
+    n = len(hol_xo)
+
+    # ---------------------------------------------------------
+    # Loop over levels
+    # ---------------------------------------------------------
+
+    for k, c in enumerate(levels):
+        f = t_holder - c
+
+        # -----------------------------------------------------
+        # Find crossings of t=c.
+        #
+        # Include the final -> first segment because the holder is a closed curve.
+        # -----------------------------------------------------
+
+        crossings = []
+
+        for j in range(n):
+            j2 = (j + 1) % n
+
+            f0 = f[j]
+            f1 = f[j2]
+            
+            if not np.isfinite(f0) or not np.isfinite(f1): continue
+
+            # Crossing
+            if (f0 > 0 and f1 < 0) or (f0 < 0 and f1 > 0):
+                alpha = -f0 / (f1 - f0)
+
+                xc = ( hol_xo[j] + alpha * (hol_xo[j2] - hol_xo[j]) )
+                yc = ( hol_yo[j] + alpha * (hol_yo[j2] - hol_yo[j]) )
+
+                # Position along holder boundary
+                s = j + alpha
+                crossings.append((s, xc, yc))
+
+        # -----------------------------------------------------
+        # Need two crossings for the geometry used by
+        # area_vol_holder.
+        # -----------------------------------------------------
+
+        if len(crossings) != 2:
+            continue
+
+        crossings.sort(key=lambda q: q[0])
+
+        s0, x0, y0 = crossings[0]
+        s1, x1, y1 = crossings[1]
+
+        # -----------------------------------------------------
+        # Determine which part of the holder boundary is inside
+        # t > c.
+        #
+        # Take points between the two crossings and test them.
+        # -----------------------------------------------------
+
+        inside_points_x = []
+        inside_points_y = []
+
+        # Walk from crossing 0 to crossing 1
+        # along the holder ordering.
+
+        j = int(np.floor(s0)) + 1
+
+        while j < np.ceil(s1):
+            jj = j % n
+
+            if f[jj] > 0:
+                inside_points_x.append(hol_xo[jj])
+                inside_points_y.append(hol_yo[jj])
+                
+            j += 1
+
+        # Check whether this is actually the t>c segment.
+        # If not, use the complementary segment.
+        # A midpoint in parameter space is sufficient.
+
+        smid = (s0 + s1) / 2
+        jmid = int(np.floor(smid)) % n
+
+        if f[jmid] <= 0:
+            # Use the complementary path.
+            inside_points_x = []
+            inside_points_y = []
+
+            j = int(np.floor(s1)) + 1
+
+            while j < int(np.ceil(s0 + n)):
+                jj = j % n
+
+                if f[jj] > 0:
+                    inside_points_x.append(hol_xo[jj])
+                    inside_points_y.append(hol_yo[jj])
+
+                j += 1
+
+            # Reverse crossing order for this path
+            x_first, y_first = x1, y1
+            x_last, y_last = x0, y0
+
+        else:
+            x_first, y_first = x0, y0
+            x_last, y_last = x1, y1
+
+        # -----------------------------------------------------
+        # Construct the same input as your area_vol_holder()
+        # -----------------------------------------------------
+
+        xh_i = np.concatenate([ [x_first], np.asarray(inside_points_x), [x_last] ])
+        yh_i = np.concatenate([ [y_first], np.asarray(inside_points_y), [y_last] ])
+
+        # -----------------------------------------------------
+        # Your existing calculation
+        # -----------------------------------------------------
+
+        Vh[k], Ah[k] = area_vol_holder( xh_i, yh_i )
+
+    return Vh, Ah
+
+
+def max_iso_width_levels(xgr, ygr, tgr, levels):
+    """
+    Calculate maximum horizontal width of the level sets t(x,y)=c
+    for the supplied levels.
+
+    This is essentially the original max_iso_width(), but the
+    implementation is vectorized over the x-direction.
+    """
+
+    x_axis = np.asarray(xgr[0, :], dtype=float)
+    t = np.asarray(tgr, dtype=float)
+
+    # Make x increasing.
+    if x_axis[0] > x_axis[-1]:
+        x_axis = x_axis[::-1]
+        t = t[:, ::-1]
+
+    levels = np.asarray(levels, dtype=float)
+    W = np.full(levels.shape, np.nan)
+
+    # Process each requested level.
+    for k, c in enumerate(levels):
+        # f has shape (ny, nx)
+        f = t - c
+
+        # Crossing between columns i and i+1
+        cross = ( ((f[:, :-1] < 0) & (f[:, 1:] >= 0)) | ((f[:, :-1] >= 0) & (f[:, 1:] < 0)) )
+        rows = np.where(np.sum(cross, axis=1) >= 2)[0]
+
+        if len(rows) == 0: continue
+
+        max_width = np.nan
+        for j in rows:
+            idx = np.where(cross[j])[0]
+
+            fj = f[j, idx]
+            fj1 = f[j, idx + 1]
+
+            xc = ( x_axis[idx] - fj * (x_axis[idx + 1] - x_axis[idx]) / (fj1 - fj) )
+
+            width = xc[-1] - xc[0]
+
+            if np.isnan(max_width) or width > max_width: max_width = width
+
+        W[k] = max_width
+    return W
+
+
+def max_iso_width_field(xgr, ygr, tgr, nlevels=1000):
+    """
+    Calculate D(x,y), where D(x,y) is the maximum horizontal
+    width of the contour t(x,y) = constant.
+
+    Parameters
+    ----------
+    xgr, ygr : 2-D arrays
+        Grid coordinates.
+    tgr : 2-D array
+        Scalar field.
+    nlevels : int
+        Number of levels used to represent W(c).
+
+    Returns
+    -------
+    D : 2-D array
+        D[i,j] = maximum horizontal width of the contour
+        whose level is tgr[i,j].
+    """
+
+    t = np.asarray(tgr, dtype=float)
+
+    finite = np.isfinite(t)
+
+    if not np.any(finite):
+        return np.full_like(t, np.nan)
+
+    tmin = np.nanmin(t)
+    tmax = np.nanmax(t)
+
+    # Choose levels spanning the complete range of t.
+    levels = np.linspace(tmin, tmax, nlevels)
+
+    W = max_iso_width_levels(xgr, ygr, t, levels)
+
+    # Interpolate W(c) back onto every t(x,y).
+    D = np.full_like(t, np.nan)
+
+    D[finite] = np.interp( t[finite], levels, W, left=np.nan, right=np.nan, )
+    return D
+
+
+def transform_angle( theta ):
+    t_theta = theta + np.pi/2
+    t_theta = np.where(t_theta > np.pi, t_theta - 2*np.pi, t_theta)
+    return t_theta
+
+def arc_length(x, y):
+    if type(x) is list:
+        s = []
+        for i in range(len(x)):
+            xg,yg = np.gradient( x[i] ), np.gradient(y[i] )
+            ss = cumulative_trapezoid( np.sqrt(xg**2 + yg**2), initial=0 )
+            s.append(ss)
+        
+    else:
+        xg,yg = np.gradient( x ), np.gradient(y)
+        s = cumulative_trapezoid( np.sqrt(xg**2 + yg**2), initial=0 )
+    
+    return s
+
+
+def divide_in_angle_time(n_a, n_t, thegr, tgr, levels):
+    """
+    Divide a 2D grid into angular and time bins.
+
+    Parameters
+    ----------
+    n_a : int
+        Number of angular bins.
+    n_t : int
+        Number of time bins.
+    thegr : ndarray
+        2D array of angles in radians.
+    tgr : ndarray
+        2D array of time values.
+
+    Returns
+    -------
+    div : ndarray
+        Same shape as thegr/tgr. Each element contains the combined`
+        
+        bin number, from 1 to n_a*n_t. NaN where tgr is NaN.
+
+    acent : ndarray
+        Centre angle of each angular bin.
+
+    tcent : ndarray
+        Centre time of each time bin.
+    """
+
+    div_a = np.floor( (thegr + np.pi) / (2 * np.pi / n_a) + 0.5 ).astype(int) % n_a 
+
+    acent_a = np.linspace( -np.pi, np.pi, n_a, endpoint=False )
+
+    # Time bins
+    # tmin, tmax = np.nanmin(tgr), np.nanmax(tgr)
+
+    # levels = np.linspace(tmin, tmax, n_t + 1)
+
+    div_t = np.digitize( tgr, levels[1:-1], right=True )
+
+    tcent_t = (levels[:-1] + levels[1:]) / 2
+    
+    # Create all combinations of (time, angle)
+    acent, tcent = np.meshgrid( acent_a, tcent_t )
+    acent = acent.ravel()
+    tcent = tcent.ravel()
+
+    # Combine angular and time bins
+    div = div_t * n_a + div_a 
+
+    # Preserve NaNs
+    div = div.astype(float)
+    div[np.isnan(tgr)] = np.nan
+
+    return div, acent, tcent
+
+
+def bin_stats(div, ar, acent, extra=5):
+    """
+    Calculate mean and standard deviation of `ar` for every bin.
+
+    Parameters
+    ----------
+    div : ndarray
+        Array containing the bin index for each element.
+        Expected values are 0 ... n_bins-1.
+    ar : ndarray
+        Array of values to calculate statistics for.
+        Same shape as div.
+    acent : ndarray
+        Angular centre for each bin.
+    tcent : ndarray
+        Time centre for each bin.
+    extra: float
+        Sets the angles at the top, between (90±extra)°, to np.nan
+
+    Returns
+    -------
+    means : ndarray
+        Mean of ar in each bin.
+    stds : ndarray
+        Standard deviation of ar in each bin.
+    acent : ndarray
+        Angular centre of each bin.
+    tcent : ndarray
+        Time centre of each bin.
+    """
+    n_bins = len(acent)
+
+    bins, values = div.ravel(), ar.ravel()
+
+    # Ignore NaNs in ar and div
+    valid = (~np.isnan(values)) & (~np.isnan(bins))
+
+    bins, values = bins[valid].astype(int), values[valid]
+
+    # Number of values in each bin
+    counts = np.bincount( bins, minlength=n_bins )
+
+    # Sum of values and squares in each bin
+    sums = np.bincount( bins, weights=values, minlength=n_bins )
+    sums_sq = np.bincount( bins, weights=values**2, minlength=n_bins )
+
+    # Mean
+    means = np.divide( sums, counts, out=np.full(n_bins, np.nan), where=counts > 0 )
+
+    # Variance
+    variance = np.divide( sums_sq, counts, out=np.full(n_bins, np.nan), where=counts > 0 ) - means**2
+
+    # Avoid tiny negative values due to floating-point errors
+    variance = np.maximum(variance, 0)
+    stds = np.sqrt(variance)
+
+    # top = (acent >= (90-extra)/180*np.pi) * (acent <= (90+extra)/180*np.pi) 
+    top = (acent >= (180-extra)/180*np.pi) * (acent <= (-180+extra)/180*np.pi) 
+
+    means[top], stds[top] = np.nan, np.nan
+
+    return means, stds 
+
+def get_contours_fast(xgr, ygr, tgr, levels):
+    """
+    Extract ordered iso-contours t(x,y) = level.
+
+    Returns
+    -------
+    x_conts, y_conts, s_conts
+
+    Each entry corresponds to one level.
+
+    The contour is ordered:
+        bottom -> right -> top -> left -> bottom
+
+    s = 0 is at the bottom of the contour.
+    Positive s goes from bottom toward the right.
+    Negative s goes from bottom toward the left.
+
+    Thus:
+        s : -L_left -> 0 -> L_right
+
+    L_left and L_right need not be equal.
+
+    Assumptions
+    -----------
+    - xgr and ygr describe a rectangular grid.
+    - xgr[0,:] is the x-axis.
+    - ygr[:,0] is the y-axis.
+    - Each level has one relevant closed contour.
+    - The contour is approximately star-shaped around (0,0),
+      so that polar angle gives a unique position around it.
+    """
+
+    x_axis = np.asarray(xgr[0, :], dtype=float)
+    y_axis = np.asarray(ygr[:, 0], dtype=float)
+    t = np.asarray(tgr, dtype=float)
+
+    x_conts = []
+    y_conts = []
+    s_conts = []
+
+    # ------------------------------------------------------------
+    # Make coordinates increasing.
+    # ------------------------------------------------------------
+    flip_x = x_axis[0] > x_axis[-1]
+    flip_y = y_axis[0] > y_axis[-1]
+
+    if flip_x:
+        x_axis = x_axis[::-1]
+        t = t[:, ::-1]
+
+    if flip_y:
+        y_axis = y_axis[::-1]
+        t = t[::-1, :]
+
+    ix = np.arange(len(x_axis))
+    iy = np.arange(len(y_axis))
+
+    for level in np.atleast_1d(levels):
+
+        contours = find_contours(t, level=level)
+
+        if len(contours) == 0:
+            x_conts.append(np.array([np.nan]))
+            y_conts.append(np.array([np.nan]))
+            s_conts.append(np.array([np.nan]))
+            continue
+
+        # Choose the longest contour.
+        contour = max(contours, key=len)
+
+        # find_contours gives (row, column) = (y, x)
+        row = contour[:, 0]
+        col = contour[:, 1]
+
+        x = np.interp(col, ix, x_axis)
+        y = np.interp(row, iy, y_axis)
+
+        # ------------------------------------------------------------
+        # Remove duplicated closing point temporarily.
+        # ------------------------------------------------------------
+        if np.hypot(x[0] - x[-1], y[0] - y[-1]) > 0:
+            x = np.append(x, x[0])
+            y = np.append(y, y[0])
+
+        x0 = x[:-1]
+        y0 = y[:-1]
+
+        n = len(x0)
+
+        # ------------------------------------------------------------
+        # Find bottom of contour.
+        # Among the lowest points, choose the one closest to x=0.
+        # ------------------------------------------------------------
+        ymin = np.min(y0)
+
+        tol = 0.01 * max(np.ptp(x0), np.ptp(y0), 1.0)
+
+        candidates = np.where(y0 <= ymin + tol)[0]
+        ib = candidates[np.argmin(np.abs(x0[candidates]))]
+
+        # ------------------------------------------------------------
+        # Determine contour orientation from the bottom.
+        #
+        # We want:
+        #
+        #     bottom -> right -> top -> left -> bottom
+        #
+        # i.e. initially x should increase.
+        # ------------------------------------------------------------
+        inext = (ib + 1) % n
+        goes_right = x0[inext] > x0[ib]
+
+        # Signed polygon area.
+        area = 0.5 * np.sum(
+            x0 * np.roll(y0, -1) -
+            np.roll(x0, -1) * y0
+        )
+
+        is_ccw = area > 0
+
+        # At the bottom, a CCW contour should initially go right.
+        if is_ccw != goes_right:
+            x0 = x0[::-1]
+            y0 = y0[::-1]
+
+            # Re-find bottom after reversal.
+            ymin = np.min(y0)
+            candidates = np.where(y0 <= ymin + tol)[0]
+            ib = candidates[np.argmin(np.abs(x0[candidates]))]
+
+        # ------------------------------------------------------------
+        # Rotate so that bottom is first.
+        # ------------------------------------------------------------
+        x = np.concatenate([x0[ib:], x0[:ib], x0[ib:ib+1]])
+        y = np.concatenate([y0[ib:], y0[:ib], y0[ib:ib+1]])
+
+        # ------------------------------------------------------------
+        # Arc length from bottom.
+        #
+        # This is always positive along the contour traversal.
+        # ------------------------------------------------------------
+        dx = np.diff(x)
+        dy = np.diff(y)
+
+        ds = np.hypot(dx, dy)
+
+        s_abs = np.concatenate([ [0.0], np.cumsum(ds) ])
+
+        # ------------------------------------------------------------
+        # Calculate angular coordinate.
+        #
+        # Bottom  =   0 deg
+        # Right   = +90 deg
+        # Top     = ±180 deg
+        # Left    = -90 deg
+        # ------------------------------------------------------------
+        theta = np.arctan2(x, -y)
+
+        # Unwrap theta so that it increases continuously
+        # along the contour.
+        theta_unwrapped = np.unwrap(theta)
+
+        # Normalize so that theta = 0 at the bottom.
+        theta_unwrapped -= theta_unwrapped[0]
+
+        # We now expect approximately:
+        #
+        #   0 -> pi -> 2*pi
+        #
+        # bottom -> right -> top -> left -> bottom
+
+        # ------------------------------------------------------------
+        # Find where the contour crosses theta = pi,
+        # i.e. the top/branch cut.
+        # ------------------------------------------------------------
+        i_top = np.argmin(np.abs(theta_unwrapped - np.pi))
+
+        # ------------------------------------------------------------
+        # Assign signed arc length.
+        #
+        # IMPORTANT:
+        # The sign change happens at the actual top of the
+        # contour, NOT at L/2.
+        # ------------------------------------------------------------
+        s = s_abs.copy()
+
+        s[i_top:] -= s_abs[i_top] + s_abs[-1] - s_abs[0]
+        
+        # Equivalent interpretation:
+        #
+        # before top:
+        #       s = 0 ... +L_right
+        #
+        # after top:
+        #       s = -L_left ... 0
+        #
+        # But the expression above needs the contour endpoint
+        # handled explicitly below.
+
+        # More directly and robustly:
+        s = np.empty_like(s_abs)
+
+        # Positive branch: bottom -> top
+        s[:i_top + 1] = s_abs[:i_top + 1]
+
+        # Negative branch: top -> left -> bottom
+        L_total = s_abs[-1]
+        L_right = s_abs[i_top]
+
+        s[i_top:] = s_abs[i_top:] - L_total
+
+        # At the top we want the positive and negative branch
+        # representations to meet through the branch cut.
+        #
+        # The top point therefore has the positive value +L_right
+        # in the positive branch and approximately -L_left in the
+        # negative branch. Since the contour contains only one
+        # physical top point, retain the positive representation.
+        s[i_top] = L_right
+
+        x_conts.append(x)
+        y_conts.append(y)
+        s_conts.append(s)
+
+    return x_conts, y_conts, s_conts
+
+
+def angle_to_arclength(angles, x_cont, y_cont, s_cont):
+    angles = np.asarray(angles)
+
+    theta = np.arctan2(x_cont, -y_cont)
+
+    # Split into negative and positive angular branches.
+    neg = theta <= 0
+    pos = theta >= 0
+
+    # Sort each branch in increasing theta.
+    theta_neg = theta[neg]
+    s_neg = s_cont[neg]
+    order_neg = np.argsort(theta_neg)
+
+    theta_pos = theta[pos]
+    s_pos = s_cont[pos]
+    order_pos = np.argsort(theta_pos)
+
+    # Interpolate separately on each side.
+    s = np.empty_like(angles, dtype=float)
+
+    mask_neg, mask_pos = angles <= 0, angles >= 0
+
+    s[mask_neg] = np.interp( angles[mask_neg], theta_neg[order_neg], s_neg[order_neg] )
+    s[mask_pos] = np.interp( angles[mask_pos], theta_pos[order_pos], s_pos[order_pos] )
+
+    return s
+
 # def 2d_area( xgr, ygr, tgr ):
 #     Vs, As, Vh, Ah = [],[], [], []
 #     for lev in levels:
@@ -692,8 +1860,655 @@ def make_circle_plot( axs, radii_ticks = [10,20,30], angle_tick_dist=45 ):
 #                         "font.family": "serif",
 #                         'font.size':12, })
 
+latent = 334e3 # m^2 / s^2 o J/kg
+rho_i = 916.7 # kg / m^3 
+
+# Fisrt item at 10°C, second at 20°C
+cp_t = [4200, 4184] # J/(kg°C)
+rho_w_t = [999.65, 998.19] # kg/m3
+k_th_t = [0.138e-6, 0.143e-6] # m^2/s
+nu_t = [1.308e-6, 1e-6 ] # m^2/s
+
 #%%
 
+path = '/Volumes/Ice blocks/Sphere channel/Results/'
+files = glob.glob( path + '*.hdf5' )
+
+max_val = 30
+ppmm = 10
+
+x = np.linspace( -max_val, max_val, 2*max_val*ppmm+1  ,endpoint=True )
+
+xgr, ygr = np.meshgrid( x,x[::-1] )
+rgr, thegr = np.sqrt( xgr**2 + ygr**2 ), np.arctan2( ygr, xgr )
+
+# opaque 10, opaque 40, clear 10, clear 40
+# files_use = [28, 30, 4, 6]
+# files_use = [28]
+
+
+ice_ts, gthings = [], [] 
+Us, Ts = [], []
+masks = []
+hol_xos, hol_yos = [], []
+ice_xos, ice_yos = [], []
+
+for i in tqdm(range(len(files))):
+    
+    cha_t, cha_s, cha_v, cha_Tb, cha_Tt, hol_x, hol_y, ice_t, ice_x, ice_y = get_data(files[i])
+    
+    U, T = np.median(cha_v), np.median( (cha_Tb+cha_Tt) / 2 )
+    if i == 22: U, T = np.median(cha_v[:500]), np.median( ((cha_Tb+cha_Tt) / 2)[:500] )
+    Us.append(U); Ts.append(T)
+        
+    dt = np.diff(ice_t)[0]
+    ice_xo, ice_yo, cx, cy = order_data(ice_x, ice_y)
+
+    ice_xo, ice_yo = ordenar_contornos(ice_xo, ice_yo)
+    ice_xo, ice_yo = keep_inside_previous(ice_xo, ice_yo, lag=1, tol=.2) 
+
+    ice_xos.append( ice_xo )
+    ice_yos.append( ice_yo )
+    
+    # print( len(ice_t), len(ice_x), len(ice_y), len(ice_xo), len(ice_yo) )
+    
+    flat_t = np.array( [t for x, t in zip(ice_xo, ice_t) for _ in x] )
+    flat_x = np.concatenate(ice_xo)
+    flat_y = np.concatenate(ice_yo)
+    
+    points = np.vstack(  (flat_x, flat_y) ).T
+    
+    thing = griddata(points, flat_t-ice_t[0], (xgr,ygr), method='linear')
+    
+    mask, mask_out, mask_in, (x_mask,y_mask) = mask_ice_pos(xgr, ygr, ice_xo, ice_yo,  hol_c=True, min_y=2)     
+    
+    hol_xo, hol_yo = order_holder(hol_x, hol_y)
+    hol_xo, hol_yo = hol_xo-cx, hol_yo-cy
+    
+    thing0 = np.copy(thing)
+    thing0[ ~mask_out ] = -5.
+    thing0[ mask_in ] = (ice_t[-1] - ice_t[0]) + 3
+
+    gthing = nangauss(thing0, 9 )
+
+    # thing0[ np.isnan(thing0) ] = 0.
+    # gthing = nangauss(thing0, 7 )
+    
+    
+    ice_ts.append( ice_t - ice_t[0] )
+    gthings.append( gthing )
+    masks.append( mask )
+    hol_xos.append( hol_xo )
+    hol_yos.append( hol_yo )
+
+#%%
+# =============================================================================
+# Figure example interpolation
+# =============================================================================
+
+# plt.rcParams.update({'font.size':20})
+
+n = -1
+
+gthing, mask = gthings[n], masks[n]
+
+mthing = np.copy(gthing)
+mthing[ ~mask ] = np.nan
+
+ice_t, ice_xo, ice_yo = ice_ts[n], ice_xos[n], ice_yos[n]
+
+levels = ice_t-ice_t[0]
+x_conts, y_conts, th_conts = get_contours(xgr, ygr, gthing, levels)
+
+
+fig, axs = plt.subplots(1, 3, figsize=(16, 7), layout='constrained')
+
+mask_hol30 = hol_yo < 30
+
+make_circle_plot(axs)
+
+im = axs[1].imshow( mthing , extent=(-30,30,-30,30), cmap='viridis', vmin=0, ) # vmax=100 )
+
+cmap = im.cmap
+norm = im.norm
+
+axs[0].plot( hol_xo[mask_hol30], hol_yo[mask_hol30], 'r-' )
+
+for n in range(0, len(ice_xo), 1):    
+    color = im.cmap(im.norm(ice_t[n]-ice_t[0]))
+    axs[0].plot( ice_xo[n], ice_yo[n], '-', markersize=1, color=color )
+axs[0].imshow( mthing , extent=(-30,30,-30,30), alpha=0 )
+
+
+for n in range(1, len(ice_xo), 3):    
+    color = im.cmap(im.norm(ice_t[n]-ice_t[0]))
+    axs[2].plot( ice_xo[n], ice_yo[n], '-', markersize=1, color=color, alpha=0.3 )
+    axs[2].plot( x_conts[n], y_conts[n], '--', markersize=1, color=color )
+axs[2].imshow( mthing , extent=(-30,30,-30,30), alpha=0 )
+
+
+for i,lab in zip([0,1,2],[r'$a)$', r'$b)$', r'$c)$']):
+    axs[i].text(-33,30, lab  )
+    
+ax_lims = [0.05,0.10,0.9,.02]
+cbar_ax = fig.add_axes(ax_lims)
+cbar = fig.colorbar(im, label=r'$t$ (s)', location='bottom', shrink=0.9, cax=cbar_ax , ticks=[0,20,40,60,80,100] )
+cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, pos: f"{int(x)}"))
+
+# fig.tight_layout()
+ 
+    
+filename = './Documents/Sphere figures/interpolation.pdf'
+# plt.savefig(filename, dpi=200, bbox_inches='tight')
+
+fig.show()
+
+#%%
+# =============================================================================
+# Comparison contour clear - opaque
+# =============================================================================
+
+# opaque 10, opaque 40, clear 10, clear 40
+files_use = [28, 30, 4, 6]
+
+fig, axs = plt.subplots(2,2, figsize=(12, 10), layout='constrained')
+axs= axs.flatten()
+
+make_circle_plot(axs)
+    
+for i,f in enumerate(files_use):
+    
+    gthing = gthings[f]
+    
+    if i%2 == 0:
+        time_cont = np.arange(0,210,10)
+    else:
+        time_cont = np.arange(0,100,5)
+        
+    levels = time_cont #ice_t-ice_t[0]
+    x_conts, y_conts, th_conts = get_contours(xgr, ygr, gthing, levels)
+    
+    for j in range(len(levels)):
+        mask = (x_conts[j] > -2.5) * (x_conts[j] < 2.5) * (y_conts[j] > 2.)
+        x_conts[j][mask], y_conts[j][mask] = np.nan, np.nan
+
+    norm = plt.Normalize()
+    colors = plt.cm.viridis( norm(levels) )
+    
+    # for j,n in enumerate(range(1, len(ice_xo), 3)):    
+    for j,n in enumerate(time_cont):    
+        color = colors[j]
+        # axs[i].plot( ice_xo[n], ice_yo[n], '-', markersize=1, color=color, alpha=0.3 )
+
+        axs[i].plot( x_conts[j], y_conts[j], '-', markersize=1, color=color )
+
+    # mthing = np.copy(gthing)
+    # mthing[~mask] = np.nan 
+    # im = axs[i].imshow( mthing , extent=(-30,30,-30,30), cmap='viridis', vmin=0, )
+
+    axs[i].axis('equal')
+
+
+axs[0].set_title(r"$U_\infty = 0.1$ m/s", pad=15) # fontsize=14,
+axs[1].set_title(r"$U_\infty = 0.4$ m/s", pad=15) # fontsize=14,
+
+axs[0].text(-0.2, 0.5, r"Opaque", va='center', ha='center', transform=axs[0].transAxes) # fontsize=14,
+axs[2].text(-0.2, 0.5, r"Clear", va='center', ha='center', transform=axs[2].transAxes) # fontsize=14,
+    
+filename = './Documents/Sphere figures/clear_opaque_compa.pdf'
+# plt.savefig(filename, dpi=200, bbox_inches='tight')
+
+fig.show()
+
+
+
+#%%
+# =============================================================================
+# Comparison vol area clear, opaque
+# =============================================================================
+
+files_use = [28, 30, 4, 6]
+type_i = ['Opaque', 'Opaque', 'Clear', 'Clear']
+velw = ['0.1','0.4','0.1','0.4']
+
+colors = ['r','b','g','m']
+fmts = ['ro-','ro-','gs-','gs-']
+
+fig, axs = plt.subplots(1,2, figsize=(9, 4), layout='constrained', sharey=True)
+axs = axs.flatten()
+
+for i,f in enumerate(files_use):
+    
+    gthing, ice_t = gthings[f], ice_ts[f]
+    # ice_xo, ice_yo = ice_xos[f], ice_yos[f]
+    hol_xo, hol_yo = hol_xos[f], hol_yos[f]
+
+    # t1 = time()
+    # levels = ice_t - ice_t[0]    
+    # x_conts, y_conts, th_conts = get_contours(xgr, ygr, gthing, levels)
+    # svo, sar, hov, har = calculate_areas_volumes_im2( xgr, ygr, gthing, hol_xo, hol_yo, levels, order_grad=2 )
+    # t2 = time()
+    # print(f, t2-t1, end =' ')
+    
+    # t1 = time()
+    # vols, ars = [],[]
+    # for j in range(len(ice_xo)):
+    #     va,aa = area_vol(ice_xo[j], ice_yo[j])
+    #     vols.append( va ); ars.append( aa )
+    # vols, ars = np.array(vols) , np.array(ars) 
+    # t2 = time()
+    # print(t2-t1, end =' ')
+        
+    t1 = time()
+    
+    levels = ice_t #- ice_t[0]    
+    V, A, dV = level_set_quantities(xgr, ygr, gthing, levels=levels, bandwidth=None)
+    Vh, Ah= holder_quantities_from_t(xgr, ygr, gthing, hol_xo, hol_yo, levels )
+    dVh = np.gradient(Vh, levels, edge_order=2)
+
+    t2 = time()
+    print(t2-t1)
+    
+    V_ice, A_ice, dV_ice = V - Vh, A-Ah, dV - dVh
+
+    
+    # axs[0].plot( levels, V_ice/V_ice[0] , '.-', color=colors[i], label=type_i[i]+ r', $U_\infty =$'+velw[i]+' m/s' )
+    # axs[1].plot( levels, A_ice/A_ice[0] , '.-', color=colors[i], label=type_i[i]+ r', $U_\infty =$'+velw[i]+' m/s' )
+    
+    axs[0].plot( levels, V_ice/V_ice[0] , fmts[i], label=type_i[i]+ r', $U_\infty =$'+velw[i]+' m/s', markersize=5, alpha=0.5 )
+    axs[1].plot( levels, A_ice/A_ice[0] , fmts[i], label=type_i[i]+ r', $U_\infty =$'+velw[i]+' m/s', markersize=5, alpha=0.5 )
+    
+
+axs[0].grid()
+axs[1].grid()
+axs[0].legend()
+axs[1].legend()
+
+axs[0].set_xlabel(r'$t$ (s)')
+axs[1].set_xlabel(r'$t$ (s)')
+axs[0].set_ylabel(r'$V/V_0$')
+axs[1].set_ylabel(r'$A/A_0$')
+
+filename = './Documents/Sphere figures/clear_opaque_volars.pdf'
+# plt.savefig(filename, dpi=200, bbox_inches='tight')
+
+
+fig.show()
+    
+
+#%%
+# =============================================================================
+# Nu vs Re
+# =============================================================================
+files_vel0 = [0,1,2,9, 22] # skip 22 because bad experiment
+
+Nus, Res = [], []
+
+for i in tqdm(range(len(files))):
+
+    if i in files_vel0:
+        Nus.append([np.nan]); Res.append([np.nan])  
+        continue
+    
+    gthing, ice_t = gthings[i], ice_ts[i]
+    hol_xo, hol_yo = hol_xos[i], hol_yos[i]
+    levels = ice_t
+        
+    U, T = Us[i], Ts[i]
+    D = max_iso_width_levels(xgr, ygr, gthings[i], levels)
+    
+    which_temp = int(T>15)
+    cp, rho_w = cp_t[which_temp], rho_w_t[which_temp]
+    k_th, nu = k_th_t[which_temp], nu_t[which_temp]
+
+    V, A, dV = level_set_quantities(xgr, ygr, gthing, levels=levels, bandwidth=None)
+    Vh, Ah= holder_quantities_from_t(xgr, ygr, gthing, hol_xo, hol_yo, levels )
+    dVh = np.gradient(Vh, levels, edge_order=2)
+
+    V_ice, A_ice, dV_ice = V - Vh, A-Ah, dV - dVh
+    
+    D = D/1000
+    V_ice, A_ice, dV_ice = V_ice * 1e-9, A_ice * 1e-6, dV_ice * 1e-9
+
+    Nu = - rho_i/rho_w * latent/(cp*T) * 1/k_th * np.cbrt(V_ice) * dV_ice / A_ice
+    Re = U/nu * D
+
+    Nus.append( Nu ); Res.append(Re)
+
+#%%
+opaqueness = [0, 1, 0,0,0,0,0,0, 0, 0,0,0,0,0,0,0,0,0, 1,1,1,1,1, 1,1,1,1,1,1,1,1]
+
+fig, ax = plt.subplots(1,2, layout='constrained', figsize=(9,4))
+
+color = ['b', 'r']
+fmt = ['s-', 'o-']
+
+for i in range(len(Nus)):
+    U, T = Us[i], Ts[i]
+
+    which_temp, which_op = int(T>15), opaqueness[i]
+
+    Pr = nu_t[which_temp] /  k_th_t[which_temp]
+
+    ax[0].plot( np.array(Res[i]), np.array(Nus[i]) / Pr**(3/4), fmt[which_op], alpha=0.5, color=color[which_temp], markersize = 4 )
+    ax[1].plot( np.mean(np.array(Res[i])), np.mean(np.array(Nus[i])) / Pr**(3/4), fmt[which_op], alpha=0.5, color=color[which_temp], markersize = 6 )
+
+    # ax[0].plot( np.array(Res[i]), np.array(Nus[i]) / 1., fmt[which_op], alpha=0.5, color=color[which_temp], markersize = 4 )
+    # ax[1].plot( np.mean(np.array(Res[i])), np.mean(np.array(Nus[i])) / 1., fmt[which_op], alpha=0.5, color=color[which_temp], markersize = 6 )
+
+re_e = np.logspace( 3, np.log10(2.2e4), 20 )
+ax[0].plot( re_e, re_e**(1/2) * 0.2, 'k--')
+
+re_e = np.logspace( np.log10(1.8e3), np.log10(2.2e4), 20 )
+ax[1].plot( re_e, re_e**(1/2) * 0.25, 'k--')
+
+ax[0].set_xscale('log')
+ax[0].set_yscale('log')
+ax[0].set_xlabel(r'Re$(t)$')
+ax[0].set_ylabel(r'Nu$(t)$ / Pr$^{3/4}$')
+
+ax[1].set_xscale('log')
+ax[1].set_yscale('log')
+ax[1].set_xlabel(r'$\langle$Re$\rangle$')
+ax[1].set_ylabel(r'$\langle$Nu$\rangle$ / Pr$^{3/4}$')
+
+
+
+legend_labels = [ r'Clear, $T_\infty = 10$°C', r'Opaque, $T_\infty = 10$°C', r'Clear, $T_\infty = 20$°C', r'Opaque, $T_\infty = 20$°C']
+legend_handles = [ Line2D([], [], color=color[j // 2], marker=fmt[j % 2][0], linestyle='None', markersize=6, alpha=0.5) for j in range(4) ]
+
+fig.legend( handles=legend_handles, labels=legend_labels, loc='outside upper center', frameon=False, ncols=4, columnspacing=1.5, handletextpad=0.4 )
+
+
+plt.show()    
+
+
+#%%
+# =============================================================================
+# Local variables (melt rate / Nu & curvature / k R), full im
+# =============================================================================
+
+exps = [27,28,29,30]
+switch = False
+adim = True
+
+if switch:
+    fig, axs = plt.subplots(4, 2, figsize=(6, 16), layout='constrained')
+    axs = axs.T
+
+else:
+    fig, axs = plt.subplots(2, 4, figsize=(16, 8), layout='constrained')
+
+make_circle_plot(axs)    
+
+for i,f in enumerate(exps):
+    
+    gthing, ice_t = gthings[f], ice_ts[f]
+    hol_xo, hol_yo = hol_xos[f], hol_yos[f]
+    levels = ice_t
+    
+    x = np.linspace( -max_val, max_val, 2*max_val*ppmm+1  ,endpoint=True )
+    mgx, mgy = np.gradient(gthing, x, -x, edge_order=2)
+    mgxx, mgxy = np.gradient(mgx, x, -x, edge_order=2)
+    mgyx, mgyy = np.gradient(mgy, x, -x, edge_order=2)
+    
+    grad_abs = np.sqrt( mgx**2 + mgy**2 )
+
+    with np.errstate(divide='ignore', invalid='ignore'):    
+        V_rec = 1 / grad_abs 
+        kurv = -( mgxx * mgy**2 + mgyy * mgx**2 - 2 * mgxy * mgx * mgy ) / np.sqrt( mgx**2 + mgy**2 )**3
+
+    V_rec[ ~masks[f] ] = np.nan
+    kurv[ ~masks[f] ] = np.nan
+    
+    if adim:
+        U, T = Us[i], Ts[i]
+        D = max_iso_width_field(xgr, ygr, gthings[n])
+        
+        which_temp = int(T>15)
+        cp, rho_w = cp_t[which_temp], rho_w_t[which_temp]
+        k_th, nu = k_th_t[which_temp], nu_t[which_temp]
+    
+        Nu_l = rho_i/rho_w * latent/(cp*T) * 1/k_th * D/1000 * V_rec/1000
+        K_adim = kurv * D/2
+        
+        imv = axs[0,i].imshow( Nu_l , extent=(-30,30,-30,30), cmap='viridis') #, vmin=0, ) # vmax=100 )
+        imk = axs[1,i].imshow( K_adim , extent=(-30,30,-30,30), cmap='viridis') #, vmin=0, ) # vmax=100 )
+
+    else:
+        imv = axs[0,i].imshow( V_rec , extent=(-30,30,-30,30), cmap='viridis') #, vmin=0, ) # vmax=100 )
+        imk = axs[1,i].imshow( kurv , extent=(-30,30,-30,30), cmap='viridis') #, vmin=0, ) # vmax=100 )
+
+    fig.colorbar(imv, ax=axs[0,i], location='bottom', shrink=0.8, aspect=40, pad=0.01 )
+    fig.colorbar(imk, ax=axs[1,i], location='bottom', shrink=0.8, aspect=40, pad=0.01 )
+
+if switch:
+    pass
+
+else:
+    for i,f in enumerate(exps):
+        axs[0,i].set_title( fr'$U_\infty = {Us[f]:.2f}$ m/s', pad=20 )
+
+    if adim:
+        axs[0,0].text(-0.2, 0.5, 'Nu', va='center', ha='center', transform=axs[0,0].transAxes, rotation=90) # fontsize=14,
+        axs[1,0].text(-0.2, 0.5, r'$k R$', va='center', ha='center', transform=axs[1,0].transAxes, rotation=90) # fontsize=14,
+
+    else:
+        axs[0,0].text(-0.2, 0.5, 'Melt rate (mm/s)', va='center', ha='center', transform=axs[0,0].transAxes, rotation=90) # fontsize=14,
+        axs[1,0].text(-0.2, 0.5, 'Curvature (1/mm)', va='center', ha='center', transform=axs[1,0].transAxes, rotation=90) # fontsize=14,
+
+    # axs[0,0].text(-100,0, 'Melt rate (mm/s)', )
+    # axs[1,0].text(-100,0, 'Curvature (1/mm)',  )
+
+fig.show()
+
+#%%
+# =============================================================================
+# Local variables (melt rate / Nu & curvature / k R), averaged
+# =============================================================================
+
+exps = [27,28,29,30]
+switch = False
+adim = True
+
+n_a = 96
+n_t = 10
+
+if switch:
+    fig, axs = plt.subplots(4, 2, figsize=(6, 16), layout='constrained', sharex=True)
+    axs = axs.T
+
+else:
+    fig, axs = plt.subplots(2, 4, figsize=(16, 8), layout='constrained', sharex=True)
+
+for i in range(4):
+    axs[0, i].sharey(axs[0, 0])
+    axs[1, i].sharey(axs[1, 0])
+
+thegr = np.arctan2( xgr, -ygr )
+
+for i,f in enumerate(exps):
+    
+    gthing, ice_t = gthings[f], ice_ts[f]
+    hol_xo, hol_yo = hol_xos[f], hol_yos[f]
+    levels = ice_t
+    
+    x = np.linspace( -max_val, max_val, 2*max_val*ppmm+1  ,endpoint=True )
+    mgx, mgy = np.gradient(gthing, x, -x, edge_order=2)
+    mgxx, mgxy = np.gradient(mgx, x, -x, edge_order=2)
+    mgyx, mgyy = np.gradient(mgy, x, -x, edge_order=2)
+    
+    grad_abs = np.sqrt( mgx**2 + mgy**2 )
+
+    with np.errstate(divide='ignore', invalid='ignore'):    
+        V_rec = 1 / grad_abs 
+        kurv = -( mgxx * mgy**2 + mgyy * mgx**2 - 2 * mgxy * mgx * mgy ) / np.sqrt( mgx**2 + mgy**2 )**3
+
+    V_rec[ ~masks[f] ] = np.nan
+    kurv[ ~masks[f] ] = np.nan
+    
+    levels = np.linspace(ice_t[0], ice_t[-1], n_t+1) 
+    
+
+    if adim:
+        U, T = Us[i], Ts[i]
+        D = max_iso_width_field(xgr, ygr, gthings[n])
+        
+        which_temp = int(T>15)
+        cp, rho_w = cp_t[which_temp], rho_w_t[which_temp]
+        k_th, nu = k_th_t[which_temp], nu_t[which_temp]
+    
+        Nu_l = rho_i/rho_w * latent/(cp*T) * 1/k_th * D/1000 * V_rec/1000
+        K_adim = kurv * D/2
+        
+        div_all, _acent, _tcent = divide_in_angle_time(n_a, n_t, thegr, gthing, levels)
+
+        k_means, k_stds = bin_stats(div_all, K_adim, _acent, extra=5)
+        mr_means, mr_stds = bin_stats(div_all, Nu_l, _acent, extra=5)
+        
+    else:
+        div_all, _acent, _tcent = divide_in_angle_time(n_a, n_t, thegr, gthing, levels)
+
+        k_means, k_stds = bin_stats(div_all, kurv, _acent, extra=5)        
+        mr_means, mr_stds = bin_stats(div_all, V_rec, _acent, extra=5)
+
+        
+    
+
+    unique_t, step_t = np.unique(_tcent, return_inverse=True)
+    x_conts, y_conts, s_conts = get_contours_fast(xgr, ygr, gthing, levels)
+    # x_cont, y_cont, th_cont = get_contours( xgr, ygr, gthing, unique_t )
+    
+    for j in range(1,n_t-1,1):
+        # ax[0].plot( x_cont[i], y_cont[i], '-', color=(i/n_t,0,1-i/n_t) )
+        
+        tval, argus = unique_t[j], np.where( step_t==j )[0]
+        t_acent, t_k_means, t_mr_means = _acent[argus], k_means[argus], mr_means[argus]
+
+        ct_acent = t_acent
+
+        side1, side2 = (ct_acent <= 0 ), (ct_acent >= 0 )
+    
+        ang_side1, ang_side2 = np.abs(ct_acent[side1]), ct_acent[side2]
+
+        kt_means_side1, kt_means_side2 = t_k_means[side1], t_k_means[side2]
+        mrt_means_side1, mrt_means_side2 = t_mr_means[side1], t_mr_means[side2]
+    
+        sort1, sort2 = np.argsort(ang_side1), np.argsort(ang_side2) 
+   
+        x_cont, y_cont = x_conts[j], y_conts[j]
+        R = ( np.max(x_cont) - np.min(x_cont) ) / 2 
+        s_plot = angle_to_arclength(ang_side1[sort1], x_cont, y_cont, s_conts[j])
+
+
+        kside_mean = ( kt_means_side2[sort2][:] + kt_means_side1[sort1][:-1] ) / 2
+        kside_mean = np.concatenate( (kside_mean, [kt_means_side1[sort1][-1]]) )
+    
+        # ax[1].plot( ang_side1[sort1] * 180/np.pi, t_means_side1[sort1], '.-', color=(i/n_t,0,1-i/n_t) )
+        # ax[1].plot( ang_side2[sort2] * 180/np.pi, t_means_side2[sort2], '.-', color=(i/n_t,0,1-i/n_t) )
+        
+        # axs[1,i].plot( ang_side1[sort1] * 180/np.pi, kside_mean, '.-', color=(j/n_t,0,1-j/n_t) ) #color=(0,i/n_t,0) )
+        axs[1,i].plot(s_plot/R, kside_mean, '.-', color=(j/n_t,0,1-j/n_t))
+
+
+        mrside_mean = ( mrt_means_side2[sort2][:] + mrt_means_side1[sort1][:-1] ) / 2
+        mrside_mean = np.concatenate( (mrside_mean, [mrt_means_side1[sort1][-1]]) )
+    
+        # ax[1].plot( ang_side1[sort1] * 180/np.pi, t_means_side1[sort1], '.-', color=(i/n_t,0,1-i/n_t) )
+        # ax[1].plot( ang_side2[sort2] * 180/np.pi, t_means_side2[sort2], '.-', color=(i/n_t,0,1-i/n_t) )
+
+        # axs[0,i].plot( ang_side1[sort1] * 180/np.pi, mrside_mean, '.-', color=(j/n_t,0,1-j/n_t) ) #color=(0,i/n_t,0) )
+        axs[0,i].plot( s_plot/R, mrside_mean, '.-', color=(j/n_t,0,1-j/n_t) ) #color=(0,i/n_t,0) )
+
+axs[0,0].set_ylabel(r'Nu')
+axs[1,0].set_ylabel(r'$k R$')
+
+for i in range(4):
+    axs[1,i].set_xlabel(r'$s/R$')
+    axs[0,i].set_title( fr'$U_\infty = {Us[f]:.2f}$ m/s' )
+
+fig.show()
+
+
+
+
+#%%
+
+#%%
+
+
+#%%
+
+
+
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+
+
+#%%
+
+
+
+
+
+
+
+#%%
 
 path = '/Volumes/Ice blocks/Sphere channel/Results/'
 files = glob.glob( path + '*.hdf5' )
@@ -1393,13 +3208,19 @@ def bin_stats(div, ar, acent, extra=5):
 
 
 #%%
-hol_xo, hol_yo = order_holder(hol_x, hol_y)
-hol_xo, hol_yo = hol_xo-cx, hol_yo-cy
+n = -1
 
-thing0 = np.copy(thing)
-thing0[ np.isnan(thing0) ] = 0.
+gthing, ice_t = gthings[n], ice_ts[n]
+ice_xo, ice_yo = ice_xos[n], ice_yos[n]
+hol_xo, hol_yo = hol_xos[n], hol_yos[n]
 
-gthing = nangauss(thing0, 7 )
+# hol_xo, hol_yo = order_holder(hol_x, hol_y)
+# hol_xo, hol_yo = hol_xo-cx, hol_yo-cy
+
+# thing0 = np.copy(thing)
+# thing0[ np.isnan(thing0) ] = 0.
+
+# gthing = nangauss(thing0, 7 )
 
 #gradient
 x = np.linspace( -max_val, max_val, 2*max_val*ppmm+1  ,endpoint=True )
@@ -1454,8 +3275,13 @@ plt.show()
 
 
 #%%
+n = -1
 
-U_inf = np.median( cha_v ) # m/s
+gthing, ice_t = gthings[n], ice_ts[n]
+ice_xo, ice_yo = ice_xos[n], ice_yos[n]
+hol_xo, hol_yo = hol_xos[n], hol_yos[n]
+
+U_inf = Us[n] #np.median( cha_v ) # m/s
 nu = 1e-6 # m^2/s
 
 n_a = 96
@@ -1927,202 +3753,7 @@ plt.show()
 
 
 
-from scipy.spatial import cKDTree
-from sklearn.neighbors import NearestNeighbors, kneighbors_graph
-from scipy.signal import convolve2d, savgol_filter
 
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import minimum_spanning_tree, dijkstra, breadth_first_order, connected_components
-
-
-def buscar_bordes_rap(tramo, k=8):
-    """
-    Find the two endpoints of an open curve given as an (N, 2) float array.
-
-    Returns (x_list, y_list, ind), where ind are the row indices of the
-    endpoints in `tramo`.
-    """
-    tramo = np.asarray(tramo, dtype=float)
-    n = len(tramo)
-    if n <= 2:
-        return [tramo[0, 0]], [tramo[0, 1]], [0]
-
-    # k-nearest-neighbour graph (edge weight = Euclidean distance)
-    k = min(k, n - 1)
-    dist, idx = cKDTree(tramo).query(tramo, k=k + 1)
-    rows = np.repeat(np.arange(n), k)
-    cols = idx[:, 1:].ravel()
-    w = np.maximum(dist[:, 1:].ravel(), 1e-12)   # zero weights would be dropped by scipy
-    ok = rows != cols                             # guard against self-loops from duplicate points
-    G = csr_matrix((w[ok], (rows[ok], cols[ok])), shape=(n, n))
-
-    # the MST removes shortcuts, leaving a tree that follows the curve
-    mst = minimum_spanning_tree(G)
-
-    # "double sweep": farthest point from anywhere is one end,
-    # farthest point from that end is the other end
-    d0 = dijkstra(mst, directed=False, indices=0)
-    d0[~np.isfinite(d0)] = -1
-    a = int(np.argmax(d0))
-
-    da = dijkstra(mst, directed=False, indices=a)
-    da[~np.isfinite(da)] = -1
-    b = int(np.argmax(da))
-
-    ind = [a, b]
-    return list(tramo[ind, 0]), list(tramo[ind, 1]), ind
-
-
-def ordenar_tramo_rap(tramo, k=8):
-
-    tramo = np.asarray(tramo, dtype=float)
-    n = len(tramo)
-    if n <= 2:
-        return tramo.copy()
-
-    # k-nearest-neighbour graph, increasing k until it is connected
-    tree = cKDTree(tramo)
-    k = min(k, n - 1)
-    while True:
-        dist, idx = tree.query(tramo, k=k + 1)
-        rows = np.repeat(np.arange(n), k)
-        cols = idx[:, 1:].ravel()
-        w = np.maximum(dist[:, 1:].ravel(), 1e-12)   # scipy drops zero weights
-        ok = rows != cols                             # ignore self-loops from duplicate points
-        G = csr_matrix((w[ok], (rows[ok], cols[ok])), shape=(n, n))
-        if connected_components(G, directed=False)[0] == 1 or k >= n - 1:
-            break
-        k = min(2 * k, n - 1)
-
-    # the MST removes shortcuts and follows the curve
-    mst = minimum_spanning_tree(G)
-
-    # double sweep: find the two borders (ends of the longest path)
-    d0 = dijkstra(mst, directed=False, indices=0)
-    d0[~np.isfinite(d0)] = -1
-    a = int(np.argmax(d0))                            # first border
-
-    da = dijkstra(mst, directed=False, indices=a)     # distance along the curve from a
-    da[~np.isfinite(da)] = np.inf                     # unreachable points (if any) go last
-    order = np.argsort(da, kind="stable")             # starts at a, ends at the other border
-
-    return tramo[order]
-
-def ordernar_contorno( x, y ):
-    tramo = np.vstack((x, y)).T
-    tra_ord = ordenar_tramo_rap(tramo)
-    return tra_ord 
-
-def ordenar_contornos( ice_xo, ice_yo):
-    x_ord, y_ord = [],[]
-    for i in range(len(ice_xo)):
-        # tramo = np.vstack((ice_xo[i], ice_yo[i])).T
-        # tra_ord = ordenar_tramo_rap(tramo)
-        tra_ord = ordernar_contorno( ice_xo[i], ice_yo[i] )
-
-        x, y = tra_ord[:,0], tra_ord[:,1]
-        ccx, ccy = np.mean(x), np.mean(y)
-        angle = np.arctan2(x - ccx, -(y - ccy) )
-        imin, imax = np.argmin(angle), np.argmax(angle)
-        sidemin = imin < imax
-
-        if sidemin:
-            ice_ox, ice_oy = x[imin:imax], y[imin:imax]
-        else:
-            ice_ox, ice_oy = x[imin:imax:-1], y[imin:imax:-1]
-
-        x_ord.append(ice_ox); y_ord.append(ice_oy)
-    return x_ord, y_ord
-
-
-def _dist_to_polygon(poly, pts, chunk=2000):
-    """Distance from each point in pts (M, 2) to the closed polyline poly (N, 2)."""
-    a = poly
-    b = np.roll(poly, -1, axis=0)                  # closing segment included
-    ab = b - a
-    ab2 = np.einsum("ij,ij->i", ab, ab)
-    ab2[ab2 == 0] = 1.0                            # degenerate (repeated) vertices
-
-    out = np.empty(len(pts))
-    for s in range(0, len(pts), chunk):            # chunked to limit memory
-        p = pts[s:s + chunk]
-        ap = p[:, None, :] - a[None, :, :]
-        t = np.clip(np.einsum("cmj,mj->cm", ap, ab) / ab2, 0.0, 1.0)
-        proj = a[None, :, :] + t[..., None] * ab[None, :, :]
-        d = np.linalg.norm(p[:, None, :] - proj, axis=2)
-        out[s:s + chunk] = d.min(axis=1)
-    return out
-
-
-def inside_mask(outer_x, outer_y, px, py, tol=0.0):
-    """
-    Boolean mask of points (px, py) that are inside the polygon (outer_x, outer_y)
-    or outside it by no more than `tol` (same units as the coordinates).
-    """
-    poly = np.column_stack((np.asarray(outer_x, float), np.asarray(outer_y, float)))
-    pts = np.column_stack((np.asarray(px, float), np.asarray(py, float)))
-    if len(poly) < 3 or len(pts) == 0:
-        return np.zeros(len(pts), dtype=bool)
-
-    mask = Path(poly).contains_points(pts)
-    if tol > 0:
-        out_idx = np.where(~mask)[0]
-        if out_idx.size:
-            d = _dist_to_polygon(poly, pts[out_idx])
-            mask[out_idx] = d <= tol
-    return mask
-
-
-def keep_inside_previous(ice_x, ice_y, lag=1, tol=0.0, use_trimmed=True, clip_early=False):
-    """
-    Keep contour i inside contour i - lag, allowing points up to `tol` outside it.
-
-    Parameters
-    ----------
-    ice_x, ice_y : list of 1D float arrays (one entry per contour, outermost first)
-    lag : int >= 1
-        How many contours back to compare against.
-    tol : float >= 0
-        Points outside the reference contour but within this distance of it
-        are kept. tol=0 gives the strict behaviour.
-    use_trimmed : bool
-        True  -> compare against the already-trimmed contour i-lag.
-        False -> compare against the original contour i-lag.
-    clip_early : bool
-        False -> the first `lag` contours are left unchanged.
-        True  -> they are compared against contour 0 instead (for i >= 1).
-    """
-    if lag < 1 or int(lag) != lag:
-        raise ValueError("lag must be an integer >= 1.")
-    if tol < 0:
-        raise ValueError("tol must be >= 0.")
-    lag = int(lag)
-
-    n = len(ice_x)
-    if n != len(ice_y):
-        raise ValueError("ice_x and ice_y must have the same number of contours.")
-
-    orig_x = [np.asarray(a, dtype=float) for a in ice_x]
-    orig_y = [np.asarray(a, dtype=float) for a in ice_y]
-    out_x, out_y = [], []
-
-    for i in range(n):
-        ref = i - lag
-        if ref < 0:
-            ref = 0 if (clip_early and i > 0) else None
-        if ref is None:
-            out_x.append(orig_x[i])
-            out_y.append(orig_y[i])
-            continue
-
-        ref_x = out_x[ref] if use_trimmed else orig_x[ref]
-        ref_y = out_y[ref] if use_trimmed else orig_y[ref]
-
-        mask = inside_mask(ref_x, ref_y, orig_x[i], orig_y[i], tol=tol)
-        out_x.append(orig_x[i][mask])
-        out_y.append(orig_y[i][mask])
-
-    return out_x, out_y
 
 #%%
 # =============================================================================
